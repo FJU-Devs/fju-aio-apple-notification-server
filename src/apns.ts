@@ -115,6 +115,7 @@ async function sendLiveActivityEvent(args: {
   courseName: string;
   classStartDate: number;
   classEndDate: number;
+  dismissalDate?: number;
   attributes?: CourseActivityAttributesPayload;
   inputPushToken?: boolean;
   includeAlert?: boolean;
@@ -133,7 +134,7 @@ async function sendLiveActivityEvent(args: {
   };
 
   if (args.event === 'end') {
-    aps['dismissal-date'] = args.classEndDate + ENDED_DISMISSAL_DELAY_SECONDS;
+    aps['dismissal-date'] = args.dismissalDate ?? args.classEndDate + ENDED_DISMISSAL_DELAY_SECONDS;
   }
 
   if (args.event === 'start') {
@@ -310,6 +311,7 @@ export async function sendActivityEnded(args: {
   courseName: string;
   classStartDate: number;
   classEndDate: number;
+  dismissalDate?: number;
 }): Promise<void> {
   logDebug('Sending quiet ended-state update before final end event.', {
     pushTokenPreview: previewToken(args.pushToken),

@@ -104,7 +104,9 @@ app.post('/activity/register', (request: Request, response: Response) => {
     ? {
         ...payload,
         classStartDate: smoothSchedule.serverClassStartDate,
-        classEndDate: smoothSchedule.serverClassEndDate
+        classEndDate: smoothSchedule.serverClassEndDate,
+        displayClassStartDate: payload.classStartDate,
+        displayClassEndDate: payload.classEndDate
       }
     : payload;
   const currentPhase: ActivityPhase = now < schedulePayload.classStartDate ? 'before' : now < schedulePayload.classEndDate ? 'during' : 'ended';
@@ -130,7 +132,7 @@ app.post('/activity/register', (request: Request, response: Response) => {
 
   store.upsert(activity);
   scheduler.schedule(activity, {
-    sendStartTransition: !smoothSchedule
+    sendStartTransition: true
   });
   logInfo('Registered live activity.', {
     activityId: activity.activityId,

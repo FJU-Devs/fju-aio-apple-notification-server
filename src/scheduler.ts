@@ -150,14 +150,16 @@ export class ActivityScheduler {
         phaseTo: 'during',
         classStartDate: activity.classStartDate,
         classEndDate: activity.classEndDate,
+        displayClassStartDate: displayClassStartDate(activity),
+        displayClassEndDate: displayClassEndDate(activity),
         pushTokenPreview: previewToken(activity.pushToken)
       });
 
       await sendActivityUpdate({
         pushToken: activity.pushToken,
         courseName: activity.courseName,
-        classStartDate: activity.classStartDate,
-        classEndDate: activity.classEndDate
+        classStartDate: displayClassStartDate(activity),
+        classEndDate: displayClassEndDate(activity)
       });
 
       const now = Math.floor(Date.now() / 1000);
@@ -195,14 +197,17 @@ export class ActivityScheduler {
         phaseTo: 'ended',
         classStartDate: activity.classStartDate,
         classEndDate: activity.classEndDate,
+        displayClassStartDate: displayClassStartDate(activity),
+        displayClassEndDate: displayClassEndDate(activity),
         pushTokenPreview: previewToken(activity.pushToken)
       });
 
       await sendActivityEnded({
         pushToken: activity.pushToken,
         courseName: activity.courseName,
-        classStartDate: activity.classStartDate,
-        classEndDate: activity.classEndDate
+        classStartDate: displayClassStartDate(activity),
+        classEndDate: displayClassEndDate(activity),
+        dismissalDate: activity.classEndDate + 30
       });
 
       const now = Math.floor(Date.now() / 1000);
@@ -262,4 +267,12 @@ function determinePhase(now: number, classStartDate: number, classEndDate: numbe
     return 'during';
   }
   return 'ended';
+}
+
+function displayClassStartDate(activity: ActivityRecord): number {
+  return activity.displayClassStartDate ?? activity.classStartDate;
+}
+
+function displayClassEndDate(activity: ActivityRecord): number {
+  return activity.displayClassEndDate ?? activity.classEndDate;
 }

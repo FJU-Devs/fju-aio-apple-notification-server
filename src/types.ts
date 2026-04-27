@@ -30,6 +30,8 @@ export interface CourseActivityContentState {
 }
 
 export interface ActivityRecord extends RegisterActivityPayload {
+  displayClassStartDate?: number;
+  displayClassEndDate?: number;
   currentPhase: ActivityPhase;
   createdAt: number;
   updatedAt: number;
