@@ -4,16 +4,20 @@ Minimal Node.js + TypeScript Express server for ActivityKit Live Activity remote
 
 ## Features
 
-- `POST /activity/register` to register or replace an in-memory Live Activity record
-- `DELETE /activity/:activityId` to remove an in-memory registration and cancel timers
+- `POST /activity/register` to register or replace a persisted Live Activity record
+- `POST /push-to-start/register` to store push-to-start tokens per user/device
+- `POST /push-to-start/schedule` to upsert durable scheduled jobs per user/device/course/start time
+- `POST /push-to-start/cancel` to cancel future jobs for a user/device
+- `DELETE /activity/:activityId` to remove a persisted registration and cancel jobs
 - `GET /activities` to inspect current registrations with redacted token previews
-- Schedules APNs pushes at `classStartDate` and `classEndDate`
+- Stores ActivityKit tokens, active registrations, scheduled jobs, retry state, APNs failures, and clock offsets in SQLite
+- Polls persisted due jobs and retries transient APNs/network failures with backoff
 - Uses APNs token-based `.p8` authentication with a manually signed JWT
 - Uses raw `node:http2` requests, not `node-apn`
 
 ## Requirements
 
-- Node.js 20+
+- Node.js 22.5+ for built-in SQLite support
 - APNs Auth Key (`.p8`)
 - Live Activity topic:
   - `com.nelsongx.apps.fju-aio.push-type.liveactivity`
@@ -35,6 +39,11 @@ cp .env.example .env
 | `APNS_TOPIC` | yes | Live Activity topic, e.g. `com.nelsongx.apps.fju-aio.push-type.liveactivity` |
 | `APNS_USE_SANDBOX` | no | Set `true` for sandbox APNs |
 | `LOG_LEVEL` | no | Set to `debug` for detailed request, scheduler, and APNs logs |
+| `DATABASE_PATH` | no | SQLite database path, defaults to `./data/apple-notification.sqlite` |
+| `APP_AUTH_TOKEN` | no | If set, protected endpoints require `Authorization: Bearer <token>` |
+| `SCHEDULER_POLL_MS` | no | Scheduler polling interval, defaults to `250` |
+| `SCHEDULER_BATCH_SIZE` | no | Max jobs claimed per poll, defaults to `25` |
+| `SCHEDULER_LOCK_SECONDS` | no | Processing lock timeout for crashed workers, defaults to `60` |
 
 ## Install
 
@@ -65,11 +74,13 @@ The raw OpenAPI document is served at `/docs/openapi.json`.
 
 ### `POST /activity/register`
 
-Registers or replaces a single Live Activity entry in the in-memory store.
+Registers or replaces a single Live Activity entry in SQLite.
 
 Request body must contain **exactly** these fields:
 
 - `activityId`
+- `userId`
+- `deviceId`
 - `pushToken`
 - `courseName`
 - `courseId`
@@ -80,6 +91,8 @@ Example:
 
 ```json
 {
+  "userId": "111111111",
+  "deviceId": "8D6B8C7E-8143-46E6-B61F-8E4E4C853111",
   "activityId": "6D56B540-30F0-4B4A-9D78-7EE9802A741D",
   "pushToken": "abcdef1234567890",
   "courseName": "資料庫系統",
@@ -110,11 +123,27 @@ Response:
 
 ### `DELETE /activity/:activityId`
 
-Deletes a registration and cancels pending timers.
+Deletes a registration and cancels pending persisted jobs for that activity.
 
 ### `GET /activities`
 
-Returns all current in-memory registrations with redacted token previews.
+Returns current persisted registrations with redacted token previews.
+
+### `POST /push-to-start/register`
+
+Stores the push-to-start token for one user/device and records the server/client clock offset.
+
+### `POST /push-to-start/schedule`
+
+Upserts future push-to-start jobs. The stable dedupe key is:
+
+```text
+userId + deviceId + courseId + classStartDate
+```
+
+### `POST /push-to-start/cancel`
+
+Cancels future queued/processing/failed jobs for one user/device. Pass `deactivateToken: true` when notifications are disabled or the user logs out.
 
 ## APNs Behavior
 

@@ -20,6 +20,19 @@ const ENDED_DISMISSAL_DELAY_SECONDS = 30;
 let cachedJwt: { token: string; issuedAt: number } | undefined;
 let cachedPrivateKey: ReturnType<typeof createPrivateKey> | undefined;
 
+export class ApnsRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly reason?: string,
+    readonly apnsId?: string,
+    readonly body?: string
+  ) {
+    super(message);
+    this.name = 'ApnsRequestError';
+  }
+}
+
 function base64UrlEncode(value: string): string {
   return Buffer.from(value)
     .toString('base64')
@@ -240,7 +253,13 @@ async function sendLiveActivityEvent(args: {
         return;
       }
 
-      reject(new Error(`APNs request failed with status ${status}: ${body || 'no response body'}`));
+      reject(new ApnsRequestError(
+        `APNs request failed with status ${status}: ${reason ?? (body || 'no response body')}`,
+        status,
+        reason,
+        apnsId,
+        body
+      ));
     });
     request.on('error', (error) => {
       if (settled) {
@@ -350,6 +369,14 @@ export function logApnsConfiguration(): void {
 
 export function logApnsError(message: string, error: unknown): void {
   logError(message, error);
+}
+
+export function isPermanentApnsTokenError(error: unknown): boolean {
+  if (!(error instanceof ApnsRequestError)) {
+    return false;
+  }
+
+  return error.status === 400 || error.status === 410 || error.reason === 'BadDeviceToken' || error.reason === 'Unregistered';
 }
 
 function parseApnsReason(body: string): string | undefined {

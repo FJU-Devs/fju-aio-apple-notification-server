@@ -1,4 +1,6 @@
 const registerActivityExample = {
+  userId: '111111111',
+  deviceId: '8D6B8C7E-8143-46E6-B61F-8E4E4C853111',
   activityId: '6D56B540-30F0-4B4A-9D78-7EE9802A741D',
   pushToken: 'abcdef1234567890',
   courseName: '資料庫系統',
@@ -10,6 +12,8 @@ const registerActivityExample = {
 const pushToStartScheduleExample = {
   schedules: [
     {
+      userId: '111111111',
+      deviceId: '8D6B8C7E-8143-46E6-B61F-8E4E4C853111',
       courseName: '資料庫系統',
       courseId: 'CS401',
       location: 'SF131',
@@ -48,7 +52,7 @@ export const openApiDocument = {
       get: {
         tags: ['Activities'],
         summary: 'List registered activities',
-        description: 'Returns all current in-memory registrations with redacted token previews.',
+        description: 'Returns current persisted registrations with redacted token previews.',
         responses: {
           '200': {
             description: 'Current activity registrations.',
@@ -76,7 +80,7 @@ export const openApiDocument = {
       post: {
         tags: ['Activities'],
         summary: 'Register or replace a Live Activity',
-        description: 'Registers or replaces a single Live Activity entry in the in-memory store.',
+        description: 'Registers or replaces a single persisted Live Activity entry.',
         requestBody: {
           required: true,
           content: {
@@ -109,7 +113,7 @@ export const openApiDocument = {
                 examples: {
                   invalidBody: {
                     value: {
-                      error: 'Request body must contain exactly these fields: activityId, pushToken, courseName, courseId, classStartDate, classEndDate'
+                      error: 'Request body must contain exactly these fields: userId, deviceId, activityId, pushToken, courseName, courseId, classStartDate, classEndDate'
                     }
                   },
                   invalidScheduleWindow: {
@@ -143,7 +147,7 @@ export const openApiDocument = {
       post: {
         tags: ['Activities'],
         summary: 'Register push-to-start token',
-        description: 'Stores the latest ActivityKit push-to-start token and the server/client clock offset.',
+        description: 'Stores an ActivityKit push-to-start token and server/client clock offset for a user/device.',
         requestBody: {
           required: true,
           content: {
@@ -152,6 +156,8 @@ export const openApiDocument = {
                 $ref: '#/components/schemas/PushToStartRegistrationPayload'
               },
               example: {
+                userId: '111111111',
+                deviceId: '8D6B8C7E-8143-46E6-B61F-8E4E4C853111',
                 pushToStartToken: 'abcdef1234567890',
                 clientUnixTime: 1760000000
               }
@@ -179,7 +185,7 @@ export const openApiDocument = {
       post: {
         tags: ['Activities'],
         summary: 'Schedule course Live Activity starts',
-        description: 'Schedules one or more real course workflow push-to-start jobs using the latest registered push-to-start token.',
+        description: 'Upserts one or more real course workflow push-to-start jobs for their user/device tokens.',
         requestBody: {
           required: true,
           content: {
@@ -206,7 +212,44 @@ export const openApiDocument = {
             }
           },
           '409': {
-            description: 'No push-to-start token is currently registered.',
+            description: 'No push-to-start token is registered for the requested user/device.',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/ErrorResponse'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    '/push-to-start/cancel': {
+      post: {
+        tags: ['Activities'],
+        summary: 'Cancel future device jobs',
+        description: 'Cancels future queued/failed/processing jobs and optionally deactivates the push-to-start token for a user/device.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                $ref: '#/components/schemas/CancelDevicePayload'
+              },
+              example: {
+                userId: '111111111',
+                deviceId: '8D6B8C7E-8143-46E6-B61F-8E4E4C853111',
+                deactivateToken: true
+              }
+            }
+          }
+        },
+        responses: {
+          '200': {
+            description: 'Future jobs cancelled.'
+          },
+          '400': {
+            description: 'Validation failed.',
             content: {
               'application/json': {
                 schema: {
@@ -222,7 +265,7 @@ export const openApiDocument = {
       delete: {
         tags: ['Activities'],
         summary: 'Delete a registered Live Activity',
-        description: 'Deletes a registration and cancels pending timers.',
+        description: 'Deletes a registration and cancels pending persisted jobs for that activity.',
         parameters: [
           {
             name: 'activityId',
@@ -274,8 +317,16 @@ export const openApiDocument = {
       RegisterActivityPayload: {
         type: 'object',
         additionalProperties: false,
-        required: ['activityId', 'pushToken', 'courseName', 'courseId', 'classStartDate', 'classEndDate'],
+        required: ['userId', 'deviceId', 'activityId', 'pushToken', 'courseName', 'courseId', 'classStartDate', 'classEndDate'],
         properties: {
+          userId: {
+            type: 'string',
+            minLength: 1
+          },
+          deviceId: {
+            type: 'string',
+            minLength: 1
+          },
           activityId: {
             type: 'string',
             minLength: 1,
@@ -314,8 +365,16 @@ export const openApiDocument = {
       PushToStartRegistrationPayload: {
         type: 'object',
         additionalProperties: false,
-        required: ['pushToStartToken', 'clientUnixTime'],
+        required: ['userId', 'deviceId', 'pushToStartToken', 'clientUnixTime'],
         properties: {
+          userId: {
+            type: 'string',
+            minLength: 1
+          },
+          deviceId: {
+            type: 'string',
+            minLength: 1
+          },
           pushToStartToken: {
             type: 'string',
             minLength: 2,
@@ -324,6 +383,25 @@ export const openApiDocument = {
           clientUnixTime: {
             type: 'integer',
             minimum: 1
+          }
+        }
+      },
+      CancelDevicePayload: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['userId', 'deviceId'],
+        properties: {
+          userId: {
+            type: 'string',
+            minLength: 1
+          },
+          deviceId: {
+            type: 'string',
+            minLength: 1
+          },
+          deactivateToken: {
+            type: 'boolean',
+            default: false
           }
         }
       },
@@ -348,6 +426,8 @@ export const openApiDocument = {
         additionalProperties: false,
         required: [
           'courseName',
+          'userId',
+          'deviceId',
           'courseId',
           'location',
           'instructor',
@@ -357,6 +437,14 @@ export const openApiDocument = {
           'initialPhase'
         ],
         properties: {
+          userId: {
+            type: 'string',
+            minLength: 1
+          },
+          deviceId: {
+            type: 'string',
+            minLength: 1
+          },
           courseName: {
             type: 'string',
             minLength: 1
@@ -419,6 +507,8 @@ export const openApiDocument = {
         type: 'object',
         required: [
           'activityId',
+          'userId',
+          'deviceId',
           'pushTokenPreview',
           'courseName',
           'courseId',
@@ -429,6 +519,12 @@ export const openApiDocument = {
           'updatedAt'
         ],
         properties: {
+          userId: {
+            type: 'string'
+          },
+          deviceId: {
+            type: 'string'
+          },
           activityId: {
             type: 'string'
           },

@@ -23,6 +23,24 @@ function parsePort(value: string | undefined): number {
   return port;
 }
 
+function optionalEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}
+
+function optionalIntegerEnv(name: string, fallback: number): number {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return parsed;
+}
+
 export const config = {
   port: parsePort(process.env.PORT),
   apnsKeyId: requireEnv('APNS_KEY_ID'),
@@ -30,5 +48,10 @@ export const config = {
   apnsKeyPath: requireEnv('APNS_KEY_PATH'),
   apnsTopic: requireEnv('APNS_TOPIC'),
   apnsUseSandbox: process.env.APNS_USE_SANDBOX === 'true',
-  logLevel: process.env.LOG_LEVEL === 'debug' ? 'debug' : 'info'
+  logLevel: process.env.LOG_LEVEL === 'debug' ? 'debug' : 'info',
+  databasePath: process.env.DATABASE_PATH?.trim() || './data/apple-notification.sqlite',
+  appAuthToken: optionalEnv('APP_AUTH_TOKEN'),
+  schedulerPollMs: optionalIntegerEnv('SCHEDULER_POLL_MS', 250),
+  schedulerBatchSize: optionalIntegerEnv('SCHEDULER_BATCH_SIZE', 25),
+  schedulerLockSeconds: optionalIntegerEnv('SCHEDULER_LOCK_SECONDS', 60)
 };

@@ -1,12 +1,16 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import swaggerUi from 'swagger-ui-express';
 
-import { logApnsConfiguration, sendActivityStart } from './apns.js';
+import { logApnsConfiguration } from './apns.js';
 import { config } from './config.js';
 import { logDebug, logError, logInfo, previewToken } from './logger.js';
 import { openApiDocument } from './openapi.js';
-import { ActivityScheduler } from './scheduler.js';
-import { ActivityStore } from './store.js';
+import { ActivityScheduler, buildPushStartJobPayload } from './scheduler.js';
+import {
+  ActivityStore,
+  pushStartJobKey,
+  remoteStartContextKey
+} from './store.js';
 import type {
   ActivityPhase,
   PushToStartSchedulePayload,
@@ -17,6 +21,8 @@ import type {
 } from './types.js';
 
 const EXPECTED_KEYS = [
+  'userId',
+  'deviceId',
   'activityId',
   'pushToken',
   'courseName',
@@ -24,10 +30,13 @@ const EXPECTED_KEYS = [
   'classStartDate',
   'classEndDate'
 ] as const;
-const PUSH_TO_START_REGISTER_KEYS = ['pushToStartToken', 'clientUnixTime'] as const;
-const REMOTE_START_KEYS = ['courseName', 'courseId', 'location', 'instructor'] as const;
+const PUSH_TO_START_REGISTER_KEYS = ['userId', 'deviceId', 'pushToStartToken', 'clientUnixTime'] as const;
+const CANCEL_DEVICE_KEYS = ['userId', 'deviceId', 'deactivateToken'] as const;
+const REMOTE_START_KEYS = ['userId', 'deviceId', 'courseName', 'courseId', 'location', 'instructor'] as const;
 const PUSH_TO_START_SCHEDULE_KEYS = ['schedules'] as const;
 const REMOTE_START_SCHEDULE_KEYS = [
+  'userId',
+  'deviceId',
   'courseName',
   'courseId',
   'location',
@@ -47,39 +56,6 @@ const FULL_CYCLE_DURING_SECONDS = 30;
 const app = express();
 const store = new ActivityStore();
 const scheduler = new ActivityScheduler(store);
-let latestPushToStartRegistration: PushToStartRegistration | undefined;
-const smoothRemoteStarts = new Map<string, SmoothRemoteStartSchedule>();
-const remoteStartQueue = new Map<string, RemoteStartJob>();
-const remoteStartTicker = setInterval(processRemoteStartQueue, 250);
-remoteStartTicker.unref?.();
-
-interface RemoteStartJob {
-  id: string;
-  serverPushAt: number;
-  pushToStartToken: string;
-  payload: RemoteStartPayload;
-  initialPhase: ActivityPhase;
-  serverClassStartDate: number;
-  serverClassEndDate: number;
-  serverEndTransitionDate?: number;
-  serverDismissalDate?: number;
-  clientClassStartDate: number;
-  clientClassEndDate: number;
-}
-
-interface PushToStartRegistration {
-  token: string;
-  serverMinusClientSeconds: number;
-  registeredAt: number;
-}
-
-interface SmoothRemoteStartSchedule {
-  serverClassStartDate: number;
-  serverClassEndDate: number;
-  serverEndTransitionDate?: number;
-  serverDismissalDate?: number;
-  sendStartTransition: boolean;
-}
 
 type SchedulableRegisterPayload = RegisterActivityPayload & {
   displayClassStartDate?: number;
@@ -88,7 +64,13 @@ type SchedulableRegisterPayload = RegisterActivityPayload & {
   dismissalDate?: number;
 };
 
+type IdentifiedRemoteStartPayload = RemoteStartPayload & {
+  userId: string;
+  deviceId: string;
+};
+
 app.use(express.json());
+app.use(requireAppAuth);
 
 app.get('/docs/openapi.json', (_request: Request, response: Response) => {
   response.json(openApiDocument);
@@ -127,7 +109,13 @@ app.post('/activity/register', (request: Request, response: Response) => {
   const now = Math.floor(Date.now() / 1000);
   const payload = parsed.payload;
   const current = store.get(payload.activityId);
-  const smoothSchedule = consumeSmoothRemoteStart(payload.courseId, payload.classStartDate, payload.classEndDate);
+  const smoothSchedule = store.consumeRemoteStartContext(
+    payload.userId,
+    payload.deviceId,
+    payload.courseId,
+    payload.classStartDate,
+    payload.classEndDate
+  );
   const schedulePayload: SchedulableRegisterPayload = smoothSchedule
     ? {
         ...payload,
@@ -148,6 +136,8 @@ app.post('/activity/register', (request: Request, response: Response) => {
   };
 
   logDebug('Accepted register request.', {
+    userId: payload.userId,
+    deviceId: payload.deviceId,
     activityId: payload.activityId,
     courseId: payload.courseId,
     currentPhase,
@@ -190,21 +180,25 @@ app.post('/push-to-start/register', (request: Request, response: Response) => {
   }
 
   const serverNow = Math.floor(Date.now() / 1000);
-  latestPushToStartRegistration = {
+  const registration = store.upsertPushToStartToken({
+    userId: parsed.payload.userId,
+    deviceId: parsed.payload.deviceId,
     token: parsed.payload.pushToStartToken,
     serverMinusClientSeconds: serverNow - parsed.payload.clientUnixTime,
     registeredAt: serverNow
-  };
+  });
   logInfo('Registered push-to-start token.', {
+    userId: registration.userId,
+    deviceId: registration.deviceId,
     pushToStartTokenPreview: previewToken(parsed.payload.pushToStartToken),
     clientUnixTime: parsed.payload.clientUnixTime,
     serverUnixTime: serverNow,
-    serverMinusClientSeconds: latestPushToStartRegistration.serverMinusClientSeconds
+    serverMinusClientSeconds: registration.serverMinusClientSeconds
   });
   response.status(201).json({
     pushToStartTokenPreview: previewToken(parsed.payload.pushToStartToken),
     serverUnixTime: serverNow,
-    serverMinusClientSeconds: latestPushToStartRegistration.serverMinusClientSeconds
+    serverMinusClientSeconds: registration.serverMinusClientSeconds
   });
 });
 
@@ -214,8 +208,9 @@ app.post('/push-to-start/full-cycle', (request: Request, response: Response) => 
     response.status(400).json({ error: parsed.error });
     return;
   }
-  if (!latestPushToStartRegistration) {
-    response.status(409).json({ error: 'No push-to-start token has been registered yet.' });
+  const registration = store.getPushToStartToken(parsed.payload.userId, parsed.payload.deviceId);
+  if (!registration) {
+    response.status(409).json({ error: 'No push-to-start token has been registered for this user/device yet.' });
     return;
   }
 
@@ -223,30 +218,48 @@ app.post('/push-to-start/full-cycle', (request: Request, response: Response) => 
   const serverPushAt = now + FULL_CYCLE_HIDDEN_SECONDS;
   const serverClassStartDate = serverPushAt + FULL_CYCLE_BEFORE_SECONDS;
   const serverClassEndDate = serverClassStartDate + FULL_CYCLE_DURING_SECONDS;
-  const clientClassStartDate = serverClassStartDate - latestPushToStartRegistration.serverMinusClientSeconds;
-  const clientClassEndDate = serverClassEndDate - latestPushToStartRegistration.serverMinusClientSeconds;
-  const pushToStartToken = latestPushToStartRegistration.token;
-  const jobId = smoothRemoteStartKey(parsed.payload.courseId, clientClassStartDate, clientClassEndDate);
-  smoothRemoteStarts.set(jobId, {
+  const clientClassStartDate = serverClassStartDate - registration.serverMinusClientSeconds;
+  const clientClassEndDate = serverClassEndDate - registration.serverMinusClientSeconds;
+  const jobId = pushStartJobKey(parsed.payload.userId, parsed.payload.deviceId, parsed.payload.courseId, clientClassStartDate);
+  const contextKey = remoteStartContextKey(
+    parsed.payload.userId,
+    parsed.payload.deviceId,
+    parsed.payload.courseId,
+    clientClassStartDate,
+    clientClassEndDate
+  );
+
+  store.upsertRemoteStartContext({
+    key: contextKey,
+    userId: parsed.payload.userId,
+    deviceId: parsed.payload.deviceId,
+    courseId: parsed.payload.courseId,
+    clientClassStartDate,
+    clientClassEndDate,
     serverClassStartDate,
     serverClassEndDate,
     serverDismissalDate: serverClassEndDate + 30,
-    sendStartTransition: true
+    sendStartTransition: true,
+    createdAt: now
   });
 
-  remoteStartQueue.set(jobId, {
+  store.upsertScheduledJob({
     id: jobId,
-    serverPushAt,
-    pushToStartToken,
-    payload: parsed.payload,
-    initialPhase: 'before',
-    serverClassStartDate,
-    serverClassEndDate,
-    clientClassStartDate,
-    clientClassEndDate
+    kind: 'push_start',
+    userId: parsed.payload.userId,
+    deviceId: parsed.payload.deviceId,
+    dueAt: serverPushAt,
+    payload: buildPushStartJobPayload({
+      ...parsed.payload,
+      initialPhase: 'before',
+      clientClassStartDate,
+      clientClassEndDate
+    })
   });
 
   logInfo('Scheduled push-to-start full-cycle test.', {
+    userId: parsed.payload.userId,
+    deviceId: parsed.payload.deviceId,
     courseId: parsed.payload.courseId,
     courseName: parsed.payload.courseName,
     serverPushAt,
@@ -254,7 +267,7 @@ app.post('/push-to-start/full-cycle', (request: Request, response: Response) => 
     serverClassEndDate,
     clientClassStartDate,
     clientClassEndDate,
-    serverMinusClientSeconds: latestPushToStartRegistration.serverMinusClientSeconds
+    serverMinusClientSeconds: registration.serverMinusClientSeconds
   });
 
   response.status(202).json({
@@ -263,7 +276,7 @@ app.post('/push-to-start/full-cycle', (request: Request, response: Response) => 
     serverClassEndDate,
     clientClassStartDate,
     clientClassEndDate,
-    serverMinusClientSeconds: latestPushToStartRegistration.serverMinusClientSeconds
+    serverMinusClientSeconds: registration.serverMinusClientSeconds
   });
 });
 
@@ -273,14 +286,20 @@ app.post('/push-to-start/schedule', (request: Request, response: Response) => {
     response.status(400).json({ error: parsed.error });
     return;
   }
-  if (!latestPushToStartRegistration) {
-    response.status(409).json({ error: 'No push-to-start token has been registered yet.' });
-    return;
-  }
 
-  const serverMinusClientSeconds = latestPushToStartRegistration.serverMinusClientSeconds;
-  const pushToStartToken = latestPushToStartRegistration.token;
   const scheduled = parsed.payload.schedules.map((schedule) => {
+    const registration = store.getPushToStartToken(schedule.userId, schedule.deviceId);
+    if (!registration) {
+      return {
+        userId: schedule.userId,
+        deviceId: schedule.deviceId,
+        courseId: schedule.courseId,
+        courseName: schedule.courseName,
+        skipped: true,
+        reason: 'No push-to-start token has been registered for this user/device.'
+      };
+    }
+    const serverMinusClientSeconds = registration.serverMinusClientSeconds;
     const serverPushAt = schedule.pushAt + serverMinusClientSeconds;
     const serverClassStartDate = schedule.classStartDate + serverMinusClientSeconds;
     const serverClassEndDate = schedule.classEndDate + serverMinusClientSeconds;
@@ -288,36 +307,52 @@ app.post('/push-to-start/schedule', (request: Request, response: Response) => {
       schedule.endAt === undefined ? undefined : schedule.endAt + serverMinusClientSeconds;
     const serverDismissalDate =
       schedule.dismissalDate === undefined ? undefined : schedule.dismissalDate + serverMinusClientSeconds;
-    const jobId = smoothRemoteStartKey(schedule.courseId, schedule.classStartDate, schedule.classEndDate);
+    const jobId = pushStartJobKey(schedule.userId, schedule.deviceId, schedule.courseId, schedule.classStartDate);
+    const contextKey = remoteStartContextKey(
+      schedule.userId,
+      schedule.deviceId,
+      schedule.courseId,
+      schedule.classStartDate,
+      schedule.classEndDate
+    );
 
-    smoothRemoteStarts.set(jobId, {
+    store.upsertRemoteStartContext({
+      key: contextKey,
+      userId: schedule.userId,
+      deviceId: schedule.deviceId,
+      courseId: schedule.courseId,
+      clientClassStartDate: schedule.classStartDate,
+      clientClassEndDate: schedule.classEndDate,
       serverClassStartDate,
       serverClassEndDate,
       serverEndTransitionDate,
       serverDismissalDate,
-      sendStartTransition: schedule.initialPhase === 'before' && (schedule.endAt ?? schedule.classEndDate) > schedule.classStartDate
+      sendStartTransition: schedule.initialPhase === 'before' && (schedule.endAt ?? schedule.classEndDate) > schedule.classStartDate,
+      createdAt: Math.floor(Date.now() / 1000)
     });
 
-    remoteStartQueue.set(jobId, {
+    store.upsertScheduledJob({
       id: jobId,
-      serverPushAt,
-      pushToStartToken,
-      payload: {
+      kind: 'push_start',
+      userId: schedule.userId,
+      deviceId: schedule.deviceId,
+      dueAt: serverPushAt,
+      payload: buildPushStartJobPayload({
+        userId: schedule.userId,
+        deviceId: schedule.deviceId,
         courseName: schedule.courseName,
         courseId: schedule.courseId,
         location: schedule.location,
-        instructor: schedule.instructor
-      },
-      initialPhase: schedule.initialPhase,
-      serverClassStartDate,
-      serverClassEndDate,
-      serverEndTransitionDate,
-      serverDismissalDate,
-      clientClassStartDate: schedule.classStartDate,
-      clientClassEndDate: schedule.classEndDate
+        instructor: schedule.instructor,
+        initialPhase: schedule.initialPhase,
+        clientClassStartDate: schedule.classStartDate,
+        clientClassEndDate: schedule.classEndDate
+      })
     });
 
     return {
+      userId: schedule.userId,
+      deviceId: schedule.deviceId,
       courseId: schedule.courseId,
       courseName: schedule.courseName,
       initialPhase: schedule.initialPhase,
@@ -330,19 +365,39 @@ app.post('/push-to-start/schedule', (request: Request, response: Response) => {
       clientClassStartDate: schedule.classStartDate,
       clientClassEndDate: schedule.classEndDate,
       clientEndAt: schedule.endAt,
-      clientDismissalDate: schedule.dismissalDate
+      clientDismissalDate: schedule.dismissalDate,
+      serverMinusClientSeconds
     };
   });
 
   logInfo('Scheduled push-to-start course workflow.', {
-    count: scheduled.length,
-    serverMinusClientSeconds
+    count: scheduled.length
   });
 
   response.status(202).json({
-    schedules: scheduled,
-    serverMinusClientSeconds
+    schedules: scheduled
   });
+});
+
+app.post('/push-to-start/cancel', (request: Request, response: Response) => {
+  const parsed = validateCancelDevicePayload(request.body);
+  if (!parsed.valid) {
+    response.status(400).json({ error: parsed.error });
+    return;
+  }
+
+  const cancelledJobs = store.cancelFutureJobsForDevice(parsed.payload.userId, parsed.payload.deviceId);
+  if (parsed.payload.deactivateToken) {
+    store.deactivatePushToStartToken(parsed.payload.userId, parsed.payload.deviceId);
+  }
+
+  logInfo('Cancelled future push-to-start jobs for device.', {
+    userId: parsed.payload.userId,
+    deviceId: parsed.payload.deviceId,
+    cancelledJobs,
+    deactivatedToken: parsed.payload.deactivateToken
+  });
+  response.status(200).json({ cancelledJobs });
 });
 
 app.delete('/activity/:activityId', (request: Request, response: Response) => {
@@ -355,7 +410,6 @@ app.delete('/activity/:activityId', (request: Request, response: Response) => {
   }
 
   scheduler.clear(activityId);
-  store.delete(activityId);
   logInfo('Deleted live activity registration.', { activityId, previousPhase: existing.currentPhase });
   response.status(204).send();
 });
@@ -391,8 +445,14 @@ function validateRegisterPayload(value: unknown):
     };
   }
 
-  const { activityId, pushToken, courseName, courseId, classStartDate, classEndDate } = value;
+  const { userId, deviceId, activityId, pushToken, courseName, courseId, classStartDate, classEndDate } = value;
 
+  if (!isNonEmptyString(userId)) {
+    return { valid: false, error: 'userId must be a non-empty string.' };
+  }
+  if (!isNonEmptyString(deviceId)) {
+    return { valid: false, error: 'deviceId must be a non-empty string.' };
+  }
   if (!isNonEmptyString(activityId)) {
     logDebug('Register payload rejected: invalid activityId.', { receivedKeys: keys });
     return { valid: false, error: 'activityId must be a non-empty string.' };
@@ -455,6 +515,8 @@ function validateRegisterPayload(value: unknown):
   return {
     valid: true,
     payload: {
+      userId,
+      deviceId,
       activityId,
       pushToken,
       courseName,
@@ -481,7 +543,13 @@ function validatePushToStartRegistrationPayload(value: unknown):
     };
   }
 
-  const { pushToStartToken, clientUnixTime } = value;
+  const { userId, deviceId, pushToStartToken, clientUnixTime } = value;
+  if (!isNonEmptyString(userId)) {
+    return { valid: false, error: 'userId must be a non-empty string.' };
+  }
+  if (!isNonEmptyString(deviceId)) {
+    return { valid: false, error: 'deviceId must be a non-empty string.' };
+  }
   if (!isNonEmptyString(pushToStartToken)) {
     return { valid: false, error: 'pushToStartToken must be a non-empty string.' };
   }
@@ -494,12 +562,50 @@ function validatePushToStartRegistrationPayload(value: unknown):
 
   return {
     valid: true,
-    payload: { pushToStartToken, clientUnixTime }
+    payload: { userId, deviceId, pushToStartToken, clientUnixTime }
+  };
+}
+
+function validateCancelDevicePayload(value: unknown):
+  | { valid: true; payload: { userId: string; deviceId: string; deactivateToken: boolean } }
+  | { valid: false; error: string } {
+  if (!isPlainObject(value)) {
+    return { valid: false, error: 'Request body must be a JSON object.' };
+  }
+
+  const keys = Object.keys(value).sort();
+  const requiredKeys = CANCEL_DEVICE_KEYS.filter((key) => key !== 'deactivateToken');
+  const allowedKeys = [...CANCEL_DEVICE_KEYS];
+  if (!keys.every((key) => allowedKeys.includes(key as (typeof CANCEL_DEVICE_KEYS)[number]))) {
+    return { valid: false, error: `Request body may only contain these fields: ${CANCEL_DEVICE_KEYS.join(', ')}` };
+  }
+  if (!requiredKeys.every((key) => keys.includes(key))) {
+    return { valid: false, error: `Request body must contain these fields: ${requiredKeys.join(', ')}` };
+  }
+
+  const { userId, deviceId, deactivateToken } = value;
+  if (!isNonEmptyString(userId)) {
+    return { valid: false, error: 'userId must be a non-empty string.' };
+  }
+  if (!isNonEmptyString(deviceId)) {
+    return { valid: false, error: 'deviceId must be a non-empty string.' };
+  }
+  if (deactivateToken !== undefined && typeof deactivateToken !== 'boolean') {
+    return { valid: false, error: 'deactivateToken must be a boolean when provided.' };
+  }
+
+  return {
+    valid: true,
+    payload: {
+      userId,
+      deviceId,
+      deactivateToken: deactivateToken === true
+    }
   };
 }
 
 function validateRemoteStartPayload(value: unknown):
-  | { valid: true; payload: RemoteStartPayload }
+  | { valid: true; payload: IdentifiedRemoteStartPayload }
   | { valid: false; error: string } {
   if (!isPlainObject(value)) {
     return { valid: false, error: 'Request body must be a JSON object.' };
@@ -514,7 +620,13 @@ function validateRemoteStartPayload(value: unknown):
     };
   }
 
-  const { courseName, courseId, location, instructor } = value;
+  const { userId, deviceId, courseName, courseId, location, instructor } = value;
+  if (!isNonEmptyString(userId)) {
+    return { valid: false, error: 'userId must be a non-empty string.' };
+  }
+  if (!isNonEmptyString(deviceId)) {
+    return { valid: false, error: 'deviceId must be a non-empty string.' };
+  }
   if (!isNonEmptyString(courseName)) {
     return { valid: false, error: 'courseName must be a non-empty string.' };
   }
@@ -531,6 +643,8 @@ function validateRemoteStartPayload(value: unknown):
   return {
     valid: true,
     payload: {
+      userId,
+      deviceId,
       courseName,
       courseId,
       location,
@@ -596,6 +710,8 @@ function validateRemoteStartSchedulePayload(value: unknown):
   }
 
   const {
+    userId,
+    deviceId,
     courseName,
     courseId,
     location,
@@ -607,6 +723,12 @@ function validateRemoteStartSchedulePayload(value: unknown):
     endAt,
     dismissalDate
   } = value;
+  if (!isNonEmptyString(userId)) {
+    return { valid: false, error: 'userId must be a non-empty string.' };
+  }
+  if (!isNonEmptyString(deviceId)) {
+    return { valid: false, error: 'deviceId must be a non-empty string.' };
+  }
   if (!isNonEmptyString(courseName)) {
     return { valid: false, error: 'courseName must be a non-empty string.' };
   }
@@ -669,6 +791,8 @@ function validateRemoteStartSchedulePayload(value: unknown):
   return {
     valid: true,
     payload: {
+      userId,
+      deviceId,
       courseName,
       courseId,
       location,
@@ -699,52 +823,30 @@ function isHexPushToken(value: string): boolean {
   return value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value);
 }
 
-function smoothRemoteStartKey(courseId: string, classStartDate: number, classEndDate: number): string {
-  return `${courseId}:${classStartDate}:${classEndDate}`;
-}
-
-function consumeSmoothRemoteStart(
-  courseId: string,
-  classStartDate: number,
-  classEndDate: number
-): SmoothRemoteStartSchedule | undefined {
-  const key = smoothRemoteStartKey(courseId, classStartDate, classEndDate);
-  const schedule = smoothRemoteStarts.get(key);
-  if (!schedule) {
-    return undefined;
-  }
-
-  smoothRemoteStarts.delete(key);
-  return schedule;
-}
-
-function processRemoteStartQueue(): void {
-  const now = Math.floor(Date.now() / 1000);
-  for (const job of remoteStartQueue.values()) {
-    if (job.serverPushAt > now) {
-      continue;
-    }
-
-    remoteStartQueue.delete(job.id);
-    void sendActivityStart({
-      pushToStartToken: job.pushToStartToken,
-      courseName: job.payload.courseName,
-      courseId: job.payload.courseId,
-      location: job.payload.location,
-      instructor: job.payload.instructor,
-      classStartDate: job.clientClassStartDate,
-      classEndDate: job.clientClassEndDate,
-      phase: job.initialPhase
-    }).catch((error: unknown) => {
-      logError('Failed to send push-to-start start event.', error);
-    });
-  }
-}
-
 function getReceivedKeys(value: unknown): string[] {
   if (!isPlainObject(value)) {
     return [];
   }
 
   return Object.keys(value).sort();
+}
+
+function requireAppAuth(request: Request, response: Response, next: NextFunction): void {
+  if (!config.appAuthToken) {
+    next();
+    return;
+  }
+
+  if (request.path === '/docs/openapi.json' || request.path.startsWith('/docs')) {
+    next();
+    return;
+  }
+
+  const expected = `Bearer ${config.appAuthToken}`;
+  if (request.header('authorization') !== expected) {
+    response.status(401).json({ error: 'Unauthorized.' });
+    return;
+  }
+
+  next();
 }

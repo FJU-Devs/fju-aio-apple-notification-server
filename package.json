@@ -4,6 +4,9 @@
   "private": true,
   "description": "Express TypeScript server for ActivityKit Live Activity APNs updates.",
   "main": "dist/server.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/server.ts",
