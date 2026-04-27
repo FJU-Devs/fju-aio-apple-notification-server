@@ -9,6 +9,10 @@ interface ActivityTimers {
   endTimer?: NodeJS.Timeout;
 }
 
+interface ScheduleOptions {
+  sendStartTransition?: boolean;
+}
+
 const RETRY_DELAY_MS = 60_000;
 
 export class ActivityScheduler {
@@ -16,11 +20,12 @@ export class ActivityScheduler {
 
   constructor(private readonly store: ActivityStore) {}
 
-  schedule(activity: ActivityRecord): void {
+  schedule(activity: ActivityRecord, options: ScheduleOptions = {}): void {
     this.clear(activity.activityId);
     const now = Math.floor(Date.now() / 1000);
     const startDelayMs = Math.max(0, (activity.classStartDate - now) * 1000);
     const endDelayMs = Math.max(0, (activity.classEndDate - now) * 1000);
+    const sendStartTransition = options.sendStartTransition ?? true;
 
     const nextPhase = determinePhase(now, activity.classStartDate, activity.classEndDate);
     logDebug('Scheduling activity transitions.', {
@@ -41,7 +46,13 @@ export class ActivityScheduler {
 
     const timerState: ActivityTimers = {};
 
-    if (now < activity.classStartDate) {
+    if (!sendStartTransition) {
+      logInfo('Skipping class start push; client will derive phase from schedule.', {
+        activityId: activity.activityId,
+        classStartDate: activity.classStartDate,
+        classEndDate: activity.classEndDate
+      });
+    } else if (now < activity.classStartDate) {
       timerState.startTimer = setTimeout(() => {
         void this.runStartTransition(activity.activityId);
       }, startDelayMs);

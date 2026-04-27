@@ -33,6 +33,7 @@ const app = express();
 const store = new ActivityStore();
 const scheduler = new ActivityScheduler(store);
 let latestPushToStartToken: string | undefined;
+const smoothRemoteStarts = new Set<string>();
 
 app.use(express.json());
 
@@ -92,7 +93,9 @@ app.post('/activity/register', (request: Request, response: Response) => {
   });
 
   store.upsert(activity);
-  scheduler.schedule(activity);
+  scheduler.schedule(activity, {
+    sendStartTransition: !consumeSmoothRemoteStart(activity.courseId, activity.classStartDate, activity.classEndDate)
+  });
   logInfo('Registered live activity.', {
     activityId: activity.activityId,
     courseId: activity.courseId,
@@ -139,6 +142,7 @@ app.post('/push-to-start/full-cycle', (request: Request, response: Response) => 
   const classStartDate = pushAt + FULL_CYCLE_BEFORE_SECONDS;
   const classEndDate = classStartDate + FULL_CYCLE_DURING_SECONDS;
   const pushToStartToken = latestPushToStartToken;
+  smoothRemoteStarts.add(smoothRemoteStartKey(parsed.payload.courseId, classStartDate, classEndDate));
 
   setTimeout(() => {
     void sendActivityStart({
@@ -374,6 +378,20 @@ function isUnixTimestamp(value: unknown): value is number {
 
 function isHexPushToken(value: string): boolean {
   return value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value);
+}
+
+function smoothRemoteStartKey(courseId: string, classStartDate: number, classEndDate: number): string {
+  return `${courseId}:${classStartDate}:${classEndDate}`;
+}
+
+function consumeSmoothRemoteStart(courseId: string, classStartDate: number, classEndDate: number): boolean {
+  const key = smoothRemoteStartKey(courseId, classStartDate, classEndDate);
+  if (!smoothRemoteStarts.has(key)) {
+    return false;
+  }
+
+  smoothRemoteStarts.delete(key);
+  return true;
 }
 
 function getReceivedKeys(value: unknown): string[] {
