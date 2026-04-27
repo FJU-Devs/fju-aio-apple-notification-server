@@ -21,6 +21,19 @@ export interface RemoteStartPayload {
   instructor: string;
 }
 
+export interface RemoteStartSchedulePayload extends RemoteStartPayload {
+  pushAt: number;
+  classStartDate: number;
+  classEndDate: number;
+  initialPhase: ActivityPhase;
+  endAt?: number;
+  dismissalDate?: number;
+}
+
+export interface PushToStartSchedulePayload {
+  schedules: RemoteStartSchedulePayload[];
+}
+
 export interface CourseActivityAttributesPayload extends RemoteStartPayload {}
 
 export interface CourseActivityContentState {
@@ -32,6 +45,8 @@ export interface CourseActivityContentState {
 export interface ActivityRecord extends RegisterActivityPayload {
   displayClassStartDate?: number;
   displayClassEndDate?: number;
+  endTransitionDate?: number;
+  dismissalDate?: number;
   currentPhase: ActivityPhase;
   createdAt: number;
   updatedAt: number;

@@ -36,7 +36,8 @@ export class ActivityScheduler {
     const nowMs = Date.now();
     const sendStartTransition = options.sendStartTransition ?? true;
     const startDueAtMs = activity.classStartDate * 1000;
-    const endDueAtMs = activity.classEndDate * 1000;
+    const endTransitionDate = activity.endTransitionDate ?? activity.classEndDate;
+    const endDueAtMs = endTransitionDate * 1000;
 
     const nextPhase = determinePhase(nowSeconds, activity.classStartDate, activity.classEndDate);
     logDebug('Scheduling activity transitions.', {
@@ -46,6 +47,7 @@ export class ActivityScheduler {
       now: nowSeconds,
       startDelayMs: Math.max(0, startDueAtMs - nowMs),
       endDelayMs: Math.max(0, endDueAtMs - nowMs),
+      endTransitionDate,
       pushTokenPreview: previewToken(activity.pushToken)
     });
 
@@ -79,12 +81,13 @@ export class ActivityScheduler {
       logDebug('Queued immediate during transition.', { activityId: activity.activityId, now: nowSeconds });
     }
 
-    if (nowSeconds < activity.classEndDate) {
+    if (nowSeconds < endTransitionDate) {
       scheduled.endDueAtMs = endDueAtMs;
       logInfo('Scheduled class end push.', {
         activityId: activity.activityId,
         endDueAtMs,
-        endDelayMs: Math.max(0, endDueAtMs - nowMs)
+        endDelayMs: Math.max(0, endDueAtMs - nowMs),
+        endTransitionDate
       });
     } else {
       scheduled.endDueAtMs = nowMs;
@@ -152,6 +155,7 @@ export class ActivityScheduler {
         classEndDate: activity.classEndDate,
         displayClassStartDate: displayClassStartDate(activity),
         displayClassEndDate: displayClassEndDate(activity),
+        dismissalDate: activity.dismissalDate,
         pushTokenPreview: previewToken(activity.pushToken)
       });
 
@@ -207,7 +211,7 @@ export class ActivityScheduler {
         courseName: activity.courseName,
         classStartDate: displayClassStartDate(activity),
         classEndDate: displayClassEndDate(activity),
-        dismissalDate: activity.classEndDate + 30
+        dismissalDate: activity.dismissalDate ?? activity.classEndDate + 30
       });
 
       const now = Math.floor(Date.now() / 1000);

@@ -7,6 +7,23 @@ const registerActivityExample = {
   classEndDate: 1760007600
 };
 
+const pushToStartScheduleExample = {
+  schedules: [
+    {
+      courseName: '資料庫系統',
+      courseId: 'CS401',
+      location: 'SF131',
+      instructor: '王小明',
+      pushAt: 1760000100,
+      classStartDate: 1760000400,
+      classEndDate: 1760007600,
+      initialPhase: 'before',
+      endAt: 1760007600,
+      dismissalDate: 1760007630
+    }
+  ]
+};
+
 export const openApiDocument = {
   openapi: '3.0.3',
   info: {
@@ -122,6 +139,85 @@ export const openApiDocument = {
         }
       }
     },
+    '/push-to-start/register': {
+      post: {
+        tags: ['Activities'],
+        summary: 'Register push-to-start token',
+        description: 'Stores the latest ActivityKit push-to-start token and the server/client clock offset.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                $ref: '#/components/schemas/PushToStartRegistrationPayload'
+              },
+              example: {
+                pushToStartToken: 'abcdef1234567890',
+                clientUnixTime: 1760000000
+              }
+            }
+          }
+        },
+        responses: {
+          '201': {
+            description: 'Push-to-start token registered.'
+          },
+          '400': {
+            description: 'Validation failed.',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/ErrorResponse'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    '/push-to-start/schedule': {
+      post: {
+        tags: ['Activities'],
+        summary: 'Schedule course Live Activity starts',
+        description: 'Schedules one or more real course workflow push-to-start jobs using the latest registered push-to-start token.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                $ref: '#/components/schemas/PushToStartSchedulePayload'
+              },
+              example: pushToStartScheduleExample
+            }
+          }
+        },
+        responses: {
+          '202': {
+            description: 'Schedules accepted.'
+          },
+          '400': {
+            description: 'Validation failed.',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/ErrorResponse'
+                }
+              }
+            }
+          },
+          '409': {
+            description: 'No push-to-start token is currently registered.',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/ErrorResponse'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     '/activity/{activityId}': {
       delete: {
         tags: ['Activities'],
@@ -214,6 +310,92 @@ export const openApiDocument = {
           }
         },
         example: registerActivityExample
+      },
+      PushToStartRegistrationPayload: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['pushToStartToken', 'clientUnixTime'],
+        properties: {
+          pushToStartToken: {
+            type: 'string',
+            minLength: 2,
+            pattern: '^(?:[0-9a-fA-F]{2})+$'
+          },
+          clientUnixTime: {
+            type: 'integer',
+            minimum: 1
+          }
+        }
+      },
+      PushToStartSchedulePayload: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['schedules'],
+        properties: {
+          schedules: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 20,
+            items: {
+              $ref: '#/components/schemas/RemoteStartSchedulePayload'
+            }
+          }
+        },
+        example: pushToStartScheduleExample
+      },
+      RemoteStartSchedulePayload: {
+        type: 'object',
+        additionalProperties: false,
+        required: [
+          'courseName',
+          'courseId',
+          'location',
+          'instructor',
+          'pushAt',
+          'classStartDate',
+          'classEndDate',
+          'initialPhase'
+        ],
+        properties: {
+          courseName: {
+            type: 'string',
+            minLength: 1
+          },
+          courseId: {
+            type: 'string',
+            minLength: 1
+          },
+          location: {
+            type: 'string'
+          },
+          instructor: {
+            type: 'string'
+          },
+          pushAt: {
+            type: 'integer',
+            minimum: 1
+          },
+          classStartDate: {
+            type: 'integer',
+            minimum: 1
+          },
+          classEndDate: {
+            type: 'integer',
+            minimum: 1
+          },
+          initialPhase: {
+            type: 'string',
+            enum: ['before', 'during']
+          },
+          endAt: {
+            type: 'integer',
+            minimum: 1
+          },
+          dismissalDate: {
+            type: 'integer',
+            minimum: 1
+          }
+        }
       },
       RegisterActivityResponse: {
         type: 'object',

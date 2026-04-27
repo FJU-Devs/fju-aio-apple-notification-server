@@ -272,12 +272,13 @@ export async function sendActivityStart(args: {
   instructor: string;
   classStartDate: number;
   classEndDate: number;
+  phase?: ActivityPhase;
 }): Promise<void> {
-  const { pushToStartToken, ...activity } = args;
+  const { pushToStartToken, phase = 'before', ...activity } = args;
   const result = await sendLiveActivityEvent({
     pushToken: pushToStartToken,
     event: 'start',
-    phase: 'before',
+    phase,
     courseName: activity.courseName,
     classStartDate: activity.classStartDate,
     classEndDate: activity.classEndDate,
