@@ -9,6 +9,19 @@ export interface RegisterActivityPayload {
   classEndDate: number;
 }
 
+export interface PushToStartRegistrationPayload {
+  pushToStartToken: string;
+}
+
+export interface RemoteStartPayload {
+  courseName: string;
+  courseId: string;
+  location: string;
+  instructor: string;
+}
+
+export interface CourseActivityAttributesPayload extends RemoteStartPayload {}
+
 export interface CourseActivityContentState {
   phase: ActivityPhase;
   classStartDate: number;

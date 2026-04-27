@@ -1,13 +1,18 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import swaggerUi from 'swagger-ui-express';
 
-import { logApnsConfiguration } from './apns.js';
+import { logApnsConfiguration, sendActivityStart } from './apns.js';
 import { config } from './config.js';
 import { logDebug, logError, logInfo, previewToken } from './logger.js';
 import { openApiDocument } from './openapi.js';
 import { ActivityScheduler } from './scheduler.js';
 import { ActivityStore } from './store.js';
-import type { ActivityPhase, RegisterActivityPayload } from './types.js';
+import type {
+  ActivityPhase,
+  PushToStartRegistrationPayload,
+  RegisterActivityPayload,
+  RemoteStartPayload
+} from './types.js';
 
 const EXPECTED_KEYS = [
   'activityId',
@@ -17,11 +22,17 @@ const EXPECTED_KEYS = [
   'classStartDate',
   'classEndDate'
 ] as const;
+const PUSH_TO_START_REGISTER_KEYS = ['pushToStartToken'] as const;
+const REMOTE_START_KEYS = ['courseName', 'courseId', 'location', 'instructor'] as const;
 const MAX_TIMEOUT_MS = 2_147_483_647;
+const FULL_CYCLE_HIDDEN_SECONDS = 30;
+const FULL_CYCLE_BEFORE_SECONDS = 30;
+const FULL_CYCLE_DURING_SECONDS = 30;
 
 const app = express();
 const store = new ActivityStore();
 const scheduler = new ActivityScheduler(store);
+let latestPushToStartToken: string | undefined;
 
 app.use(express.json());
 
@@ -95,6 +106,66 @@ app.post('/activity/register', (request: Request, response: Response) => {
     currentPhase: activity.currentPhase,
     classStartDate: activity.classStartDate,
     classEndDate: activity.classEndDate
+  });
+});
+
+app.post('/push-to-start/register', (request: Request, response: Response) => {
+  const parsed = validatePushToStartRegistrationPayload(request.body);
+  if (!parsed.valid) {
+    response.status(400).json({ error: parsed.error });
+    return;
+  }
+
+  latestPushToStartToken = parsed.payload.pushToStartToken;
+  logInfo('Registered push-to-start token.', {
+    pushToStartTokenPreview: previewToken(parsed.payload.pushToStartToken)
+  });
+  response.status(201).json({ pushToStartTokenPreview: previewToken(parsed.payload.pushToStartToken) });
+});
+
+app.post('/push-to-start/full-cycle', (request: Request, response: Response) => {
+  const parsed = validateRemoteStartPayload(request.body);
+  if (!parsed.valid) {
+    response.status(400).json({ error: parsed.error });
+    return;
+  }
+  if (!latestPushToStartToken) {
+    response.status(409).json({ error: 'No push-to-start token has been registered yet.' });
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const pushAt = now + FULL_CYCLE_HIDDEN_SECONDS;
+  const classStartDate = pushAt + FULL_CYCLE_BEFORE_SECONDS;
+  const classEndDate = classStartDate + FULL_CYCLE_DURING_SECONDS;
+  const pushToStartToken = latestPushToStartToken;
+
+  setTimeout(() => {
+    void sendActivityStart({
+      pushToStartToken,
+      courseName: parsed.payload.courseName,
+      courseId: parsed.payload.courseId,
+      location: parsed.payload.location,
+      instructor: parsed.payload.instructor,
+      classStartDate,
+      classEndDate
+    }).catch((error: unknown) => {
+      logError('Failed to send push-to-start full-cycle start event.', error);
+    });
+  }, FULL_CYCLE_HIDDEN_SECONDS * 1000);
+
+  logInfo('Scheduled push-to-start full-cycle test.', {
+    courseId: parsed.payload.courseId,
+    courseName: parsed.payload.courseName,
+    pushAt,
+    classStartDate,
+    classEndDate
+  });
+
+  response.status(202).json({
+    pushAt,
+    classStartDate,
+    classEndDate
   });
 });
 
@@ -214,6 +285,77 @@ function validateRegisterPayload(value: unknown):
       courseId,
       classStartDate,
       classEndDate
+    }
+  };
+}
+
+function validatePushToStartRegistrationPayload(value: unknown):
+  | { valid: true; payload: PushToStartRegistrationPayload }
+  | { valid: false; error: string } {
+  if (!isPlainObject(value)) {
+    return { valid: false, error: 'Request body must be a JSON object.' };
+  }
+
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [...PUSH_TO_START_REGISTER_KEYS].sort();
+  if (keys.length !== expectedKeys.length || !keys.every((key, index) => key === expectedKeys[index])) {
+    return {
+      valid: false,
+      error: `Request body must contain exactly these fields: ${PUSH_TO_START_REGISTER_KEYS.join(', ')}`
+    };
+  }
+
+  const { pushToStartToken } = value;
+  if (!isNonEmptyString(pushToStartToken)) {
+    return { valid: false, error: 'pushToStartToken must be a non-empty string.' };
+  }
+  if (!isHexPushToken(pushToStartToken)) {
+    return { valid: false, error: 'pushToStartToken must be a hex-encoded string.' };
+  }
+
+  return {
+    valid: true,
+    payload: { pushToStartToken }
+  };
+}
+
+function validateRemoteStartPayload(value: unknown):
+  | { valid: true; payload: RemoteStartPayload }
+  | { valid: false; error: string } {
+  if (!isPlainObject(value)) {
+    return { valid: false, error: 'Request body must be a JSON object.' };
+  }
+
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [...REMOTE_START_KEYS].sort();
+  if (keys.length !== expectedKeys.length || !keys.every((key, index) => key === expectedKeys[index])) {
+    return {
+      valid: false,
+      error: `Request body must contain exactly these fields: ${REMOTE_START_KEYS.join(', ')}`
+    };
+  }
+
+  const { courseName, courseId, location, instructor } = value;
+  if (!isNonEmptyString(courseName)) {
+    return { valid: false, error: 'courseName must be a non-empty string.' };
+  }
+  if (!isNonEmptyString(courseId)) {
+    return { valid: false, error: 'courseId must be a non-empty string.' };
+  }
+  if (typeof location !== 'string') {
+    return { valid: false, error: 'location must be a string.' };
+  }
+  if (typeof instructor !== 'string') {
+    return { valid: false, error: 'instructor must be a string.' };
+  }
+
+  return {
+    valid: true,
+    payload: {
+      courseName,
+      courseId,
+      location,
+      instructor
     }
   };
 }

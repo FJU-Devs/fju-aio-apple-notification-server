@@ -4,7 +4,12 @@ import { createPrivateKey, createSign } from 'node:crypto';
 
 import { config } from './config.js';
 import { logDebug, logError, logInfo, previewToken } from './logger.js';
-import type { ActivityPhase, ApnsSendResult, CourseActivityContentState } from './types.js';
+import type {
+  ActivityPhase,
+  ApnsSendResult,
+  CourseActivityAttributesPayload,
+  CourseActivityContentState
+} from './types.js';
 
 const APNS_ORIGIN = config.apnsUseSandbox
   ? 'https://api.sandbox.push.apple.com'
@@ -79,6 +84,13 @@ function createApnsSession(): Promise<ClientHttp2Session> {
 }
 
 function buildAlert(phase: ActivityPhase, courseName: string): { title: string; body: string } {
+  if (phase === 'before') {
+    return {
+      title: '即將上課',
+      body: `${courseName} 即將開始。`
+    };
+  }
+
   if (phase === 'during') {
     return {
       title: '上課中',
@@ -98,11 +110,13 @@ function toAppleReferenceDateSeconds(unixSeconds: number): number {
 
 async function sendLiveActivityEvent(args: {
   pushToken: string;
-  event: 'update' | 'end';
+  event: 'start' | 'update' | 'end';
   phase: ActivityPhase;
   courseName: string;
   classStartDate: number;
   classEndDate: number;
+  attributes?: CourseActivityAttributesPayload;
+  inputPushToken?: boolean;
   includeAlert?: boolean;
 }): Promise<ApnsSendResult> {
   const session = await createApnsSession();
@@ -120,6 +134,14 @@ async function sendLiveActivityEvent(args: {
 
   if (args.event === 'end') {
     aps['dismissal-date'] = args.classEndDate + ENDED_DISMISSAL_DELAY_SECONDS;
+  }
+
+  if (args.event === 'start') {
+    aps['attributes-type'] = 'CourseActivityAttributes';
+    aps.attributes = args.attributes;
+    if (args.inputPushToken) {
+      aps['input-push-token'] = 1;
+    }
   }
 
   if (args.includeAlert !== false) {
@@ -162,6 +184,7 @@ async function sendLiveActivityEvent(args: {
       authorization: `bearer ${jwt}`,
       'apns-push-type': 'liveactivity',
       'apns-topic': config.apnsTopic,
+      'apns-priority': '10',
       'content-type': 'application/json'
     });
 
@@ -238,6 +261,34 @@ async function sendLiveActivityEvent(args: {
 
     request.end(payload);
   });
+}
+
+export async function sendActivityStart(args: {
+  pushToStartToken: string;
+  courseName: string;
+  courseId: string;
+  location: string;
+  instructor: string;
+  classStartDate: number;
+  classEndDate: number;
+}): Promise<void> {
+  const { pushToStartToken, ...activity } = args;
+  const result = await sendLiveActivityEvent({
+    pushToken: pushToStartToken,
+    event: 'start',
+    phase: 'before',
+    courseName: activity.courseName,
+    classStartDate: activity.classStartDate,
+    classEndDate: activity.classEndDate,
+    attributes: {
+      courseName: activity.courseName,
+      courseId: activity.courseId,
+      location: activity.location,
+      instructor: activity.instructor
+    },
+    inputPushToken: true
+  });
+  logInfo('Sent APNs live activity start event.', result);
 }
 
 export async function sendActivityUpdate(args: {
