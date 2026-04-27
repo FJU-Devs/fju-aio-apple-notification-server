@@ -22,7 +22,7 @@ const EXPECTED_KEYS = [
   'classStartDate',
   'classEndDate'
 ] as const;
-const PUSH_TO_START_REGISTER_KEYS = ['pushToStartToken'] as const;
+const PUSH_TO_START_REGISTER_KEYS = ['pushToStartToken', 'clientUnixTime'] as const;
 const REMOTE_START_KEYS = ['courseName', 'courseId', 'location', 'instructor'] as const;
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const FULL_CYCLE_HIDDEN_SECONDS = 30;
@@ -32,19 +32,32 @@ const FULL_CYCLE_DURING_SECONDS = 30;
 const app = express();
 const store = new ActivityStore();
 const scheduler = new ActivityScheduler(store);
-let latestPushToStartToken: string | undefined;
-const smoothRemoteStarts = new Set<string>();
+let latestPushToStartRegistration: PushToStartRegistration | undefined;
+const smoothRemoteStarts = new Map<string, SmoothRemoteStartSchedule>();
 const remoteStartQueue = new Map<string, RemoteStartJob>();
 const remoteStartTicker = setInterval(processRemoteStartQueue, 250);
 remoteStartTicker.unref?.();
 
 interface RemoteStartJob {
   id: string;
-  pushAt: number;
+  serverPushAt: number;
   pushToStartToken: string;
   payload: RemoteStartPayload;
-  classStartDate: number;
-  classEndDate: number;
+  serverClassStartDate: number;
+  serverClassEndDate: number;
+  clientClassStartDate: number;
+  clientClassEndDate: number;
+}
+
+interface PushToStartRegistration {
+  token: string;
+  serverMinusClientSeconds: number;
+  registeredAt: number;
+}
+
+interface SmoothRemoteStartSchedule {
+  serverClassStartDate: number;
+  serverClassEndDate: number;
 }
 
 app.use(express.json());
@@ -86,9 +99,17 @@ app.post('/activity/register', (request: Request, response: Response) => {
   const now = Math.floor(Date.now() / 1000);
   const payload = parsed.payload;
   const current = store.get(payload.activityId);
-  const currentPhase: ActivityPhase = now < payload.classStartDate ? 'before' : now < payload.classEndDate ? 'during' : 'ended';
+  const smoothSchedule = consumeSmoothRemoteStart(payload.courseId, payload.classStartDate, payload.classEndDate);
+  const schedulePayload = smoothSchedule
+    ? {
+        ...payload,
+        classStartDate: smoothSchedule.serverClassStartDate,
+        classEndDate: smoothSchedule.serverClassEndDate
+      }
+    : payload;
+  const currentPhase: ActivityPhase = now < schedulePayload.classStartDate ? 'before' : now < schedulePayload.classEndDate ? 'during' : 'ended';
   const activity = {
-    ...payload,
+    ...schedulePayload,
     currentPhase,
     createdAt: current?.createdAt ?? now,
     updatedAt: now
@@ -101,12 +122,15 @@ app.post('/activity/register', (request: Request, response: Response) => {
     isReplace: Boolean(current),
     classStartDate: payload.classStartDate,
     classEndDate: payload.classEndDate,
+    scheduleClassStartDate: schedulePayload.classStartDate,
+    scheduleClassEndDate: schedulePayload.classEndDate,
+    isSmoothRemoteStart: Boolean(smoothSchedule),
     pushTokenPreview: previewToken(payload.pushToken)
   });
 
   store.upsert(activity);
   scheduler.schedule(activity, {
-    sendStartTransition: !consumeSmoothRemoteStart(activity.courseId, activity.classStartDate, activity.classEndDate)
+    sendStartTransition: !smoothSchedule
   });
   logInfo('Registered live activity.', {
     activityId: activity.activityId,
@@ -131,11 +155,23 @@ app.post('/push-to-start/register', (request: Request, response: Response) => {
     return;
   }
 
-  latestPushToStartToken = parsed.payload.pushToStartToken;
+  const serverNow = Math.floor(Date.now() / 1000);
+  latestPushToStartRegistration = {
+    token: parsed.payload.pushToStartToken,
+    serverMinusClientSeconds: serverNow - parsed.payload.clientUnixTime,
+    registeredAt: serverNow
+  };
   logInfo('Registered push-to-start token.', {
-    pushToStartTokenPreview: previewToken(parsed.payload.pushToStartToken)
+    pushToStartTokenPreview: previewToken(parsed.payload.pushToStartToken),
+    clientUnixTime: parsed.payload.clientUnixTime,
+    serverUnixTime: serverNow,
+    serverMinusClientSeconds: latestPushToStartRegistration.serverMinusClientSeconds
   });
-  response.status(201).json({ pushToStartTokenPreview: previewToken(parsed.payload.pushToStartToken) });
+  response.status(201).json({
+    pushToStartTokenPreview: previewToken(parsed.payload.pushToStartToken),
+    serverUnixTime: serverNow,
+    serverMinusClientSeconds: latestPushToStartRegistration.serverMinusClientSeconds
+  });
 });
 
 app.post('/push-to-start/full-cycle', (request: Request, response: Response) => {
@@ -144,40 +180,53 @@ app.post('/push-to-start/full-cycle', (request: Request, response: Response) => 
     response.status(400).json({ error: parsed.error });
     return;
   }
-  if (!latestPushToStartToken) {
+  if (!latestPushToStartRegistration) {
     response.status(409).json({ error: 'No push-to-start token has been registered yet.' });
     return;
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const pushAt = now + FULL_CYCLE_HIDDEN_SECONDS;
-  const classStartDate = pushAt + FULL_CYCLE_BEFORE_SECONDS;
-  const classEndDate = classStartDate + FULL_CYCLE_DURING_SECONDS;
-  const pushToStartToken = latestPushToStartToken;
-  smoothRemoteStarts.add(smoothRemoteStartKey(parsed.payload.courseId, classStartDate, classEndDate));
+  const serverPushAt = now + FULL_CYCLE_HIDDEN_SECONDS;
+  const serverClassStartDate = serverPushAt + FULL_CYCLE_BEFORE_SECONDS;
+  const serverClassEndDate = serverClassStartDate + FULL_CYCLE_DURING_SECONDS;
+  const clientClassStartDate = serverClassStartDate - latestPushToStartRegistration.serverMinusClientSeconds;
+  const clientClassEndDate = serverClassEndDate - latestPushToStartRegistration.serverMinusClientSeconds;
+  const pushToStartToken = latestPushToStartRegistration.token;
+  const jobId = smoothRemoteStartKey(parsed.payload.courseId, clientClassStartDate, clientClassEndDate);
+  smoothRemoteStarts.set(jobId, {
+    serverClassStartDate,
+    serverClassEndDate
+  });
 
-  const jobId = smoothRemoteStartKey(parsed.payload.courseId, classStartDate, classEndDate);
   remoteStartQueue.set(jobId, {
     id: jobId,
-    pushAt,
+    serverPushAt,
     pushToStartToken,
     payload: parsed.payload,
-    classStartDate,
-    classEndDate
+    serverClassStartDate,
+    serverClassEndDate,
+    clientClassStartDate,
+    clientClassEndDate
   });
 
   logInfo('Scheduled push-to-start full-cycle test.', {
     courseId: parsed.payload.courseId,
     courseName: parsed.payload.courseName,
-    pushAt,
-    classStartDate,
-    classEndDate
+    serverPushAt,
+    serverClassStartDate,
+    serverClassEndDate,
+    clientClassStartDate,
+    clientClassEndDate,
+    serverMinusClientSeconds: latestPushToStartRegistration.serverMinusClientSeconds
   });
 
   response.status(202).json({
-    pushAt,
-    classStartDate,
-    classEndDate
+    serverPushAt,
+    serverClassStartDate,
+    serverClassEndDate,
+    clientClassStartDate,
+    clientClassEndDate,
+    serverMinusClientSeconds: latestPushToStartRegistration.serverMinusClientSeconds
   });
 });
 
@@ -317,17 +366,20 @@ function validatePushToStartRegistrationPayload(value: unknown):
     };
   }
 
-  const { pushToStartToken } = value;
+  const { pushToStartToken, clientUnixTime } = value;
   if (!isNonEmptyString(pushToStartToken)) {
     return { valid: false, error: 'pushToStartToken must be a non-empty string.' };
   }
   if (!isHexPushToken(pushToStartToken)) {
     return { valid: false, error: 'pushToStartToken must be a hex-encoded string.' };
   }
+  if (!isUnixTimestamp(clientUnixTime)) {
+    return { valid: false, error: 'clientUnixTime must be a Unix timestamp in seconds.' };
+  }
 
   return {
     valid: true,
-    payload: { pushToStartToken }
+    payload: { pushToStartToken, clientUnixTime }
   };
 }
 
@@ -392,20 +444,25 @@ function smoothRemoteStartKey(courseId: string, classStartDate: number, classEnd
   return `${courseId}:${classStartDate}:${classEndDate}`;
 }
 
-function consumeSmoothRemoteStart(courseId: string, classStartDate: number, classEndDate: number): boolean {
+function consumeSmoothRemoteStart(
+  courseId: string,
+  classStartDate: number,
+  classEndDate: number
+): SmoothRemoteStartSchedule | undefined {
   const key = smoothRemoteStartKey(courseId, classStartDate, classEndDate);
-  if (!smoothRemoteStarts.has(key)) {
-    return false;
+  const schedule = smoothRemoteStarts.get(key);
+  if (!schedule) {
+    return undefined;
   }
 
   smoothRemoteStarts.delete(key);
-  return true;
+  return schedule;
 }
 
 function processRemoteStartQueue(): void {
   const now = Math.floor(Date.now() / 1000);
   for (const job of remoteStartQueue.values()) {
-    if (job.pushAt > now) {
+    if (job.serverPushAt > now) {
       continue;
     }
 
@@ -416,8 +473,8 @@ function processRemoteStartQueue(): void {
       courseId: job.payload.courseId,
       location: job.payload.location,
       instructor: job.payload.instructor,
-      classStartDate: job.classStartDate,
-      classEndDate: job.classEndDate
+      classStartDate: job.clientClassStartDate,
+      classEndDate: job.clientClassEndDate
     }).catch((error: unknown) => {
       logError('Failed to send push-to-start full-cycle start event.', error);
     });

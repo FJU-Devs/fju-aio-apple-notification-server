@@ -11,6 +11,7 @@ export interface RegisterActivityPayload {
 
 export interface PushToStartRegistrationPayload {
   pushToStartToken: string;
+  clientUnixTime: number;
 }
 
 export interface RemoteStartPayload {
