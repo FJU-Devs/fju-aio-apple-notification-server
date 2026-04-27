@@ -4,9 +4,12 @@ import { logDebug, logInfo, previewToken } from './logger.js';
 import { ActivityStore } from './store.js';
 import type { ActivityPhase, ActivityRecord } from './types.js';
 
-interface ActivityTimers {
-  startTimer?: NodeJS.Timeout;
-  endTimer?: NodeJS.Timeout;
+interface ScheduledActivity {
+  activityId: string;
+  startDueAtMs?: number;
+  endDueAtMs?: number;
+  startInFlight: boolean;
+  endInFlight: boolean;
 }
 
 interface ScheduleOptions {
@@ -14,37 +17,49 @@ interface ScheduleOptions {
 }
 
 const RETRY_DELAY_MS = 60_000;
+const TICK_INTERVAL_MS = 250;
 
 export class ActivityScheduler {
-  private readonly timers = new Map<string, ActivityTimers>();
+  private readonly scheduled = new Map<string, ScheduledActivity>();
+  private readonly tickTimer: NodeJS.Timeout;
 
-  constructor(private readonly store: ActivityStore) {}
+  constructor(private readonly store: ActivityStore) {
+    this.tickTimer = setInterval(() => {
+      this.tick();
+    }, TICK_INTERVAL_MS);
+    this.tickTimer.unref?.();
+  }
 
   schedule(activity: ActivityRecord, options: ScheduleOptions = {}): void {
     this.clear(activity.activityId);
-    const now = Math.floor(Date.now() / 1000);
-    const startDelayMs = Math.max(0, (activity.classStartDate - now) * 1000);
-    const endDelayMs = Math.max(0, (activity.classEndDate - now) * 1000);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const nowMs = Date.now();
     const sendStartTransition = options.sendStartTransition ?? true;
+    const startDueAtMs = activity.classStartDate * 1000;
+    const endDueAtMs = activity.classEndDate * 1000;
 
-    const nextPhase = determinePhase(now, activity.classStartDate, activity.classEndDate);
+    const nextPhase = determinePhase(nowSeconds, activity.classStartDate, activity.classEndDate);
     logDebug('Scheduling activity transitions.', {
       activityId: activity.activityId,
       previousPhase: activity.currentPhase,
       nextPhase,
-      now,
-      startDelayMs,
-      endDelayMs,
+      now: nowSeconds,
+      startDelayMs: Math.max(0, startDueAtMs - nowMs),
+      endDelayMs: Math.max(0, endDueAtMs - nowMs),
       pushTokenPreview: previewToken(activity.pushToken)
     });
 
     this.store.upsert({
       ...activity,
       currentPhase: nextPhase,
-      updatedAt: now
+      updatedAt: nowSeconds
     });
 
-    const timerState: ActivityTimers = {};
+    const scheduled: ScheduledActivity = {
+      activityId: activity.activityId,
+      startInFlight: false,
+      endInFlight: false
+    };
 
     if (!sendStartTransition) {
       logInfo('Skipping class start push; client will derive phase from schedule.', {
@@ -52,60 +67,79 @@ export class ActivityScheduler {
         classStartDate: activity.classStartDate,
         classEndDate: activity.classEndDate
       });
-    } else if (now < activity.classStartDate) {
-      timerState.startTimer = setTimeout(() => {
-        void this.runStartTransition(activity.activityId);
-      }, startDelayMs);
-      logInfo('Scheduled class start push.', { activityId: activity.activityId, startDelayMs });
-    } else if (now < activity.classEndDate) {
-      logDebug('Running immediate during transition.', { activityId: activity.activityId, now });
-      void this.runImmediateDuring(activity.activityId);
+    } else if (nowSeconds < activity.classStartDate) {
+      scheduled.startDueAtMs = startDueAtMs;
+      logInfo('Scheduled class start push.', {
+        activityId: activity.activityId,
+        startDueAtMs,
+        startDelayMs: Math.max(0, startDueAtMs - nowMs)
+      });
+    } else if (nowSeconds < activity.classEndDate) {
+      scheduled.startDueAtMs = nowMs;
+      logDebug('Queued immediate during transition.', { activityId: activity.activityId, now: nowSeconds });
     }
 
-    if (now < activity.classEndDate) {
-      timerState.endTimer = setTimeout(() => {
-        void this.runEndTransition(activity.activityId);
-      }, endDelayMs);
-      logInfo('Scheduled class end push.', { activityId: activity.activityId, endDelayMs });
+    if (nowSeconds < activity.classEndDate) {
+      scheduled.endDueAtMs = endDueAtMs;
+      logInfo('Scheduled class end push.', {
+        activityId: activity.activityId,
+        endDueAtMs,
+        endDelayMs: Math.max(0, endDueAtMs - nowMs)
+      });
     } else {
-      logDebug('Running immediate end transition.', { activityId: activity.activityId, now });
-      void this.runEndTransition(activity.activityId);
+      scheduled.endDueAtMs = nowMs;
+      logDebug('Queued immediate end transition.', { activityId: activity.activityId, now: nowSeconds });
     }
 
-    this.timers.set(activity.activityId, timerState);
+    this.scheduled.set(activity.activityId, scheduled);
+    this.tick();
   }
 
   clear(activityId: string): void {
-    const existing = this.timers.get(activityId);
-    if (!existing) {
-      logDebug('No scheduled timers found to clear.', { activityId });
-      return;
+    const deleted = this.scheduled.delete(activityId);
+    if (deleted) {
+      logDebug('Cleared scheduled transitions.', { activityId });
+    } else {
+      logDebug('No scheduled transitions found to clear.', { activityId });
     }
+  }
 
-    if (existing.startTimer) {
-      clearTimeout(existing.startTimer);
-    }
-    if (existing.endTimer) {
-      clearTimeout(existing.endTimer);
-    }
+  private tick(): void {
+    const nowMs = Date.now();
+    for (const scheduled of this.scheduled.values()) {
+      if (
+        scheduled.startDueAtMs !== undefined &&
+        scheduled.startDueAtMs <= nowMs &&
+        !scheduled.startInFlight
+      ) {
+        scheduled.startInFlight = true;
+        scheduled.startDueAtMs = undefined;
+        void this.runStartTransition(scheduled.activityId);
+      }
 
-    this.timers.delete(activityId);
-    logDebug('Cleared scheduled timers.', {
-      activityId,
-      clearedStartTimer: Boolean(existing.startTimer),
-      clearedEndTimer: Boolean(existing.endTimer)
-    });
+      if (
+        scheduled.endDueAtMs !== undefined &&
+        scheduled.endDueAtMs <= nowMs &&
+        !scheduled.endInFlight
+      ) {
+        scheduled.endInFlight = true;
+        scheduled.endDueAtMs = undefined;
+        void this.runEndTransition(scheduled.activityId);
+      }
+    }
   }
 
   private async runStartTransition(activityId: string): Promise<void> {
     const activity = this.store.get(activityId);
     if (!activity) {
       logDebug('Skipped start transition.', { activityId, reason: 'missing' });
+      this.markStartComplete(activityId);
       return;
     }
 
     if (activity.currentPhase === 'during' || activity.currentPhase === 'ended') {
       logDebug('Skipped start transition.', { activityId, reason: `already-${activity.currentPhase}` });
+      this.markStartComplete(activityId);
       return;
     }
 
@@ -132,51 +166,10 @@ export class ActivityScheduler {
         currentPhase: 'during',
         updatedAt: now
       });
+      this.markStartComplete(activityId);
       logDebug('Marked activity as during after APNs success.', { activityId, updatedAt: now });
     } catch (error: unknown) {
       logApnsError(`Failed to send start transition for ${activityId}.`, error);
-      this.retryStartTransition(activityId);
-    }
-  }
-
-  private async runImmediateDuring(activityId: string): Promise<void> {
-    const activity = this.store.get(activityId);
-    if (!activity) {
-      logDebug('Skipped immediate during transition.', { activityId, reason: 'missing' });
-      return;
-    }
-
-    if (activity.currentPhase === 'ended') {
-      logDebug('Skipped immediate during transition.', { activityId, reason: 'already-ended' });
-      return;
-    }
-
-    try {
-      logDebug('Dispatching immediate during APNs update.', {
-        activityId,
-        phaseFrom: activity.currentPhase,
-        phaseTo: 'during',
-        classStartDate: activity.classStartDate,
-        classEndDate: activity.classEndDate,
-        pushTokenPreview: previewToken(activity.pushToken)
-      });
-
-      await sendActivityUpdate({
-        pushToken: activity.pushToken,
-        courseName: activity.courseName,
-        classStartDate: activity.classStartDate,
-        classEndDate: activity.classEndDate
-      });
-
-      const now = Math.floor(Date.now() / 1000);
-      this.store.upsert({
-        ...activity,
-        currentPhase: 'during',
-        updatedAt: now
-      });
-      logDebug('Marked activity as during after immediate APNs success.', { activityId, updatedAt: now });
-    } catch (error: unknown) {
-      logApnsError(`Failed to send immediate during update for ${activityId}.`, error);
       this.retryStartTransition(activityId);
     }
   }
@@ -185,11 +178,13 @@ export class ActivityScheduler {
     const activity = this.store.get(activityId);
     if (!activity) {
       logDebug('Skipped end transition.', { activityId, reason: 'missing' });
+      this.clear(activityId);
       return;
     }
 
     if (activity.currentPhase === 'ended') {
       logDebug('Skipped end transition.', { activityId, reason: 'already-ended' });
+      this.clear(activityId);
       return;
     }
 
@@ -224,21 +219,37 @@ export class ActivityScheduler {
     }
   }
 
+  private markStartComplete(activityId: string): void {
+    const scheduled = this.scheduled.get(activityId);
+    if (!scheduled) {
+      return;
+    }
+
+    scheduled.startInFlight = false;
+    if (scheduled.startDueAtMs === undefined && scheduled.endDueAtMs === undefined) {
+      this.scheduled.delete(activityId);
+    }
+  }
+
   private retryStartTransition(activityId: string): void {
-    const timers = this.timers.get(activityId) ?? {};
-    timers.startTimer = setTimeout(() => {
-      void this.runStartTransition(activityId);
-    }, RETRY_DELAY_MS);
-    this.timers.set(activityId, timers);
+    const scheduled = this.scheduled.get(activityId);
+    if (!scheduled) {
+      return;
+    }
+
+    scheduled.startInFlight = false;
+    scheduled.startDueAtMs = Date.now() + RETRY_DELAY_MS;
     logDebug('Scheduled retry for start transition.', { activityId, retryDelayMs: RETRY_DELAY_MS });
   }
 
   private retryEndTransition(activityId: string): void {
-    const timers = this.timers.get(activityId) ?? {};
-    timers.endTimer = setTimeout(() => {
-      void this.runEndTransition(activityId);
-    }, RETRY_DELAY_MS);
-    this.timers.set(activityId, timers);
+    const scheduled = this.scheduled.get(activityId);
+    if (!scheduled) {
+      return;
+    }
+
+    scheduled.endInFlight = false;
+    scheduled.endDueAtMs = Date.now() + RETRY_DELAY_MS;
     logDebug('Scheduled retry for end transition.', { activityId, retryDelayMs: RETRY_DELAY_MS });
   }
 }

@@ -34,6 +34,18 @@ const store = new ActivityStore();
 const scheduler = new ActivityScheduler(store);
 let latestPushToStartToken: string | undefined;
 const smoothRemoteStarts = new Set<string>();
+const remoteStartQueue = new Map<string, RemoteStartJob>();
+const remoteStartTicker = setInterval(processRemoteStartQueue, 250);
+remoteStartTicker.unref?.();
+
+interface RemoteStartJob {
+  id: string;
+  pushAt: number;
+  pushToStartToken: string;
+  payload: RemoteStartPayload;
+  classStartDate: number;
+  classEndDate: number;
+}
 
 app.use(express.json());
 
@@ -144,19 +156,15 @@ app.post('/push-to-start/full-cycle', (request: Request, response: Response) => 
   const pushToStartToken = latestPushToStartToken;
   smoothRemoteStarts.add(smoothRemoteStartKey(parsed.payload.courseId, classStartDate, classEndDate));
 
-  setTimeout(() => {
-    void sendActivityStart({
-      pushToStartToken,
-      courseName: parsed.payload.courseName,
-      courseId: parsed.payload.courseId,
-      location: parsed.payload.location,
-      instructor: parsed.payload.instructor,
-      classStartDate,
-      classEndDate
-    }).catch((error: unknown) => {
-      logError('Failed to send push-to-start full-cycle start event.', error);
-    });
-  }, FULL_CYCLE_HIDDEN_SECONDS * 1000);
+  const jobId = smoothRemoteStartKey(parsed.payload.courseId, classStartDate, classEndDate);
+  remoteStartQueue.set(jobId, {
+    id: jobId,
+    pushAt,
+    pushToStartToken,
+    payload: parsed.payload,
+    classStartDate,
+    classEndDate
+  });
 
   logInfo('Scheduled push-to-start full-cycle test.', {
     courseId: parsed.payload.courseId,
@@ -392,6 +400,28 @@ function consumeSmoothRemoteStart(courseId: string, classStartDate: number, clas
 
   smoothRemoteStarts.delete(key);
   return true;
+}
+
+function processRemoteStartQueue(): void {
+  const now = Math.floor(Date.now() / 1000);
+  for (const job of remoteStartQueue.values()) {
+    if (job.pushAt > now) {
+      continue;
+    }
+
+    remoteStartQueue.delete(job.id);
+    void sendActivityStart({
+      pushToStartToken: job.pushToStartToken,
+      courseName: job.payload.courseName,
+      courseId: job.payload.courseId,
+      location: job.payload.location,
+      instructor: job.payload.instructor,
+      classStartDate: job.classStartDate,
+      classEndDate: job.classEndDate
+    }).catch((error: unknown) => {
+      logError('Failed to send push-to-start full-cycle start event.', error);
+    });
+  }
 }
 
 function getReceivedKeys(value: unknown): string[] {
