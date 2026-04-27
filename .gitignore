@@ -24,3 +24,5 @@ coverage/
 
 # TypeScript cache
 *.tsbuildinfo
+
+*.p8

@@ -29,5 +29,6 @@ export const config = {
   apnsTeamId: requireEnv('APNS_TEAM_ID'),
   apnsKeyPath: requireEnv('APNS_KEY_PATH'),
   apnsTopic: requireEnv('APNS_TOPIC'),
-  apnsUseSandbox: process.env.APNS_USE_SANDBOX === 'true'
+  apnsUseSandbox: process.env.APNS_USE_SANDBOX === 'true',
+  logLevel: process.env.LOG_LEVEL === 'debug' ? 'debug' : 'info'
 };

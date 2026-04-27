@@ -1,3 +1,4 @@
+import { previewToken } from './logger.js';
 import type { ActivityListItem, ActivityRecord } from './types.js';
 
 export class ActivityStore {
@@ -19,7 +20,7 @@ export class ActivityStore {
   list(): ActivityListItem[] {
     return Array.from(this.activities.values()).map((activity) => ({
       activityId: activity.activityId,
-      pushTokenPreview: redactToken(activity.pushToken),
+      pushTokenPreview: previewToken(activity.pushToken),
       courseName: activity.courseName,
       courseId: activity.courseId,
       classStartDate: activity.classStartDate,
@@ -29,12 +30,4 @@ export class ActivityStore {
       updatedAt: activity.updatedAt
     }));
   }
-}
-
-function redactToken(token: string): string {
-  if (token.length <= 10) {
-    return 'redacted';
-  }
-
-  return `${token.slice(0, 6)}...${token.slice(-4)}`;
 }

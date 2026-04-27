@@ -34,6 +34,7 @@ cp .env.example .env
 | `APNS_KEY_PATH` | yes | Absolute path to the APNs `.p8` file |
 | `APNS_TOPIC` | yes | Live Activity topic, e.g. `com.nelsongx.apps.fju-aio.push-type.liveactivity` |
 | `APNS_USE_SANDBOX` | no | Set `true` for sandbox APNs |
+| `LOG_LEVEL` | no | Set to `debug` for detailed request, scheduler, and APNs logs |
 
 ## Install
 
@@ -57,6 +58,10 @@ npm start
 ```
 
 ## API
+
+Interactive API documentation is available at `/docs`.
+
+The raw OpenAPI document is served at `/docs/openapi.json`.
 
 ### `POST /activity/register`
 
@@ -87,8 +92,10 @@ Example:
 Validation rules:
 
 - all string fields must be non-empty strings
+- `pushToken` must be a hex-encoded string with an even number of characters
 - `classStartDate` and `classEndDate` must be Unix timestamps in seconds
 - `classEndDate` must be greater than `classStartDate`
+- `classStartDate` and `classEndDate` must be within 24.8 days of the current server time
 
 Response:
 
