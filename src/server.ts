@@ -32,7 +32,7 @@ const EXPECTED_KEYS = [
   'classEndDate'
 ] as const;
 const PUSH_TO_START_REGISTER_KEYS = ['userId', 'deviceId', 'pushToStartToken', 'clientUnixTime'] as const;
-const CANCEL_DEVICE_KEYS = ['userId', 'deviceId', 'deactivateToken'] as const;
+const CANCEL_DEVICE_KEYS = ['userId', 'deviceId', 'semester', 'deactivateToken'] as const;
 const REMOTE_START_KEYS = ['userId', 'deviceId', 'courseName', 'courseId', 'location', 'instructor'] as const;
 const PUSH_TO_START_SCHEDULE_KEYS = ['schedules'] as const;
 const PUSH_TO_START_SEMESTER_SYNC_KEYS = ['userId', 'deviceId', 'semester', 'semesterEndDate', 'schedules'] as const;
@@ -345,7 +345,14 @@ app.post('/push-to-start/cancel', (request: Request, response: Response) => {
     return;
   }
 
-  const cancelledJobs = store.cancelFutureJobsForDevice(parsed.payload.userId, parsed.payload.deviceId);
+  const cancelledJobs = parsed.payload.semester === undefined
+    ? store.cancelFutureJobsForDevice(parsed.payload.userId, parsed.payload.deviceId)
+    : store.cancelStalePushStartJobsForSemester(
+        parsed.payload.userId,
+        parsed.payload.deviceId,
+        parsed.payload.semester,
+        []
+      );
   if (parsed.payload.deactivateToken) {
     store.deactivatePushToStartToken(parsed.payload.userId, parsed.payload.deviceId);
   }
@@ -353,6 +360,7 @@ app.post('/push-to-start/cancel', (request: Request, response: Response) => {
   logInfo('Cancelled future push-to-start jobs for device.', {
     userId: parsed.payload.userId,
     deviceId: parsed.payload.deviceId,
+    semester: parsed.payload.semester,
     cancelledJobs,
     deactivatedToken: parsed.payload.deactivateToken
   });
@@ -621,14 +629,14 @@ function validatePushToStartRegistrationPayload(value: unknown):
 }
 
 function validateCancelDevicePayload(value: unknown):
-  | { valid: true; payload: { userId: string; deviceId: string; deactivateToken: boolean } }
+  | { valid: true; payload: { userId: string; deviceId: string; semester?: string; deactivateToken: boolean } }
   | { valid: false; error: string } {
   if (!isPlainObject(value)) {
     return { valid: false, error: 'Request body must be a JSON object.' };
   }
 
   const keys = Object.keys(value).sort();
-  const requiredKeys = CANCEL_DEVICE_KEYS.filter((key) => key !== 'deactivateToken');
+  const requiredKeys = CANCEL_DEVICE_KEYS.filter((key) => key !== 'deactivateToken' && key !== 'semester');
   const allowedKeys = [...CANCEL_DEVICE_KEYS];
   if (!keys.every((key) => allowedKeys.includes(key as (typeof CANCEL_DEVICE_KEYS)[number]))) {
     return { valid: false, error: `Request body may only contain these fields: ${CANCEL_DEVICE_KEYS.join(', ')}` };
@@ -637,12 +645,15 @@ function validateCancelDevicePayload(value: unknown):
     return { valid: false, error: `Request body must contain these fields: ${requiredKeys.join(', ')}` };
   }
 
-  const { userId, deviceId, deactivateToken } = value;
+  const { userId, deviceId, semester, deactivateToken } = value;
   if (!isNonEmptyString(userId)) {
     return { valid: false, error: 'userId must be a non-empty string.' };
   }
   if (!isNonEmptyString(deviceId)) {
     return { valid: false, error: 'deviceId must be a non-empty string.' };
+  }
+  if (semester !== undefined && !isNonEmptyString(semester)) {
+    return { valid: false, error: 'semester must be a non-empty string when provided.' };
   }
   if (deactivateToken !== undefined && typeof deactivateToken !== 'boolean') {
     return { valid: false, error: 'deactivateToken must be a boolean when provided.' };
@@ -653,6 +664,7 @@ function validateCancelDevicePayload(value: unknown):
     payload: {
       userId,
       deviceId,
+      semester: typeof semester === 'string' ? semester : undefined,
       deactivateToken: deactivateToken === true
     }
   };
