@@ -15,6 +15,7 @@ import type {
   ActivityPhase,
   PushToStartSchedulePayload,
   PushToStartRegistrationPayload,
+  PushToStartSemesterSyncPayload,
   RegisterActivityPayload,
   RemoteStartPayload,
   RemoteStartSchedulePayload
@@ -34,9 +35,11 @@ const PUSH_TO_START_REGISTER_KEYS = ['userId', 'deviceId', 'pushToStartToken', '
 const CANCEL_DEVICE_KEYS = ['userId', 'deviceId', 'deactivateToken'] as const;
 const REMOTE_START_KEYS = ['userId', 'deviceId', 'courseName', 'courseId', 'location', 'instructor'] as const;
 const PUSH_TO_START_SCHEDULE_KEYS = ['schedules'] as const;
+const PUSH_TO_START_SEMESTER_SYNC_KEYS = ['userId', 'deviceId', 'semester', 'semesterEndDate', 'schedules'] as const;
 const REMOTE_START_SCHEDULE_KEYS = [
   'userId',
   'deviceId',
+  'semester',
   'courseName',
   'courseId',
   'location',
@@ -49,6 +52,7 @@ const REMOTE_START_SCHEDULE_KEYS = [
   'dismissalDate'
 ] as const;
 const MAX_TIMEOUT_MS = 2_147_483_647;
+const MAX_SEMESTER_SYNC_SECONDS = 220 * 24 * 60 * 60;
 const FULL_CYCLE_HIDDEN_SECONDS = 30;
 const FULL_CYCLE_BEFORE_SECONDS = 30;
 const FULL_CYCLE_DURING_SECONDS = 30;
@@ -287,88 +291,7 @@ app.post('/push-to-start/schedule', (request: Request, response: Response) => {
     return;
   }
 
-  const scheduled = parsed.payload.schedules.map((schedule) => {
-    const registration = store.getPushToStartToken(schedule.userId, schedule.deviceId);
-    if (!registration) {
-      return {
-        userId: schedule.userId,
-        deviceId: schedule.deviceId,
-        courseId: schedule.courseId,
-        courseName: schedule.courseName,
-        skipped: true,
-        reason: 'No push-to-start token has been registered for this user/device.'
-      };
-    }
-    const serverMinusClientSeconds = registration.serverMinusClientSeconds;
-    const serverPushAt = schedule.pushAt + serverMinusClientSeconds;
-    const serverClassStartDate = schedule.classStartDate + serverMinusClientSeconds;
-    const serverClassEndDate = schedule.classEndDate + serverMinusClientSeconds;
-    const serverEndTransitionDate =
-      schedule.endAt === undefined ? undefined : schedule.endAt + serverMinusClientSeconds;
-    const serverDismissalDate =
-      schedule.dismissalDate === undefined ? undefined : schedule.dismissalDate + serverMinusClientSeconds;
-    const jobId = pushStartJobKey(schedule.userId, schedule.deviceId, schedule.courseId, schedule.classStartDate);
-    const contextKey = remoteStartContextKey(
-      schedule.userId,
-      schedule.deviceId,
-      schedule.courseId,
-      schedule.classStartDate,
-      schedule.classEndDate
-    );
-
-    store.upsertRemoteStartContext({
-      key: contextKey,
-      userId: schedule.userId,
-      deviceId: schedule.deviceId,
-      courseId: schedule.courseId,
-      clientClassStartDate: schedule.classStartDate,
-      clientClassEndDate: schedule.classEndDate,
-      serverClassStartDate,
-      serverClassEndDate,
-      serverEndTransitionDate,
-      serverDismissalDate,
-      sendStartTransition: schedule.initialPhase === 'before' && (schedule.endAt ?? schedule.classEndDate) > schedule.classStartDate,
-      createdAt: Math.floor(Date.now() / 1000)
-    });
-
-    store.upsertScheduledJob({
-      id: jobId,
-      kind: 'push_start',
-      userId: schedule.userId,
-      deviceId: schedule.deviceId,
-      dueAt: serverPushAt,
-      payload: buildPushStartJobPayload({
-        userId: schedule.userId,
-        deviceId: schedule.deviceId,
-        courseName: schedule.courseName,
-        courseId: schedule.courseId,
-        location: schedule.location,
-        instructor: schedule.instructor,
-        initialPhase: schedule.initialPhase,
-        clientClassStartDate: schedule.classStartDate,
-        clientClassEndDate: schedule.classEndDate
-      })
-    });
-
-    return {
-      userId: schedule.userId,
-      deviceId: schedule.deviceId,
-      courseId: schedule.courseId,
-      courseName: schedule.courseName,
-      initialPhase: schedule.initialPhase,
-      serverPushAt,
-      serverClassStartDate,
-      serverClassEndDate,
-      serverEndTransitionDate,
-      serverDismissalDate,
-      clientPushAt: schedule.pushAt,
-      clientClassStartDate: schedule.classStartDate,
-      clientClassEndDate: schedule.classEndDate,
-      clientEndAt: schedule.endAt,
-      clientDismissalDate: schedule.dismissalDate,
-      serverMinusClientSeconds
-    };
-  });
+  const scheduled = parsed.payload.schedules.map((schedule) => upsertPushStartSchedule(schedule));
 
   logInfo('Scheduled push-to-start course workflow.', {
     count: scheduled.length
@@ -376,6 +299,42 @@ app.post('/push-to-start/schedule', (request: Request, response: Response) => {
 
   response.status(202).json({
     schedules: scheduled
+  });
+});
+
+app.post('/push-to-start/sync-semester', (request: Request, response: Response) => {
+  const parsed = validatePushToStartSemesterSyncPayload(request.body);
+  if (!parsed.valid) {
+    response.status(400).json({ error: parsed.error });
+    return;
+  }
+
+  const scheduled = parsed.payload.schedules.map((schedule) => upsertPushStartSchedule({
+    ...schedule,
+    semester: parsed.payload.semester
+  }));
+  const activeJobIds = scheduled.map((schedule) => schedule.jobId);
+  const cancelledJobs = store.cancelStalePushStartJobsForSemester(
+    parsed.payload.userId,
+    parsed.payload.deviceId,
+    parsed.payload.semester,
+    activeJobIds
+  );
+
+  logInfo('Synced semester push-to-start workflow.', {
+    userId: parsed.payload.userId,
+    deviceId: parsed.payload.deviceId,
+    semester: parsed.payload.semester,
+    semesterEndDate: parsed.payload.semesterEndDate,
+    scheduledJobs: scheduled.length,
+    cancelledJobs
+  });
+
+  response.status(202).json({
+    semester: parsed.payload.semester,
+    semesterEndDate: parsed.payload.semesterEndDate,
+    scheduledJobs: scheduled.length,
+    cancelledJobs
   });
 });
 
@@ -423,6 +382,101 @@ app.listen(config.port, () => {
   logApnsConfiguration();
   logInfo(`Server listening on port ${config.port}.`, { logLevel: config.logLevel });
 });
+
+function upsertPushStartSchedule(schedule: RemoteStartSchedulePayload): {
+  jobId: string;
+  userId: string;
+  deviceId: string;
+  courseId: string;
+  courseName: string;
+  initialPhase: ActivityPhase;
+  serverPushAt: number;
+  serverClassStartDate: number;
+  serverClassEndDate: number;
+  serverEndTransitionDate?: number;
+  serverDismissalDate?: number;
+  clientPushAt: number;
+  clientClassStartDate: number;
+  clientClassEndDate: number;
+  clientEndAt?: number;
+  clientDismissalDate?: number;
+  serverMinusClientSeconds: number;
+  hasPushToStartToken: boolean;
+} {
+  const registration = store.getPushToStartToken(schedule.userId, schedule.deviceId);
+  const serverMinusClientSeconds = registration?.serverMinusClientSeconds ?? 0;
+  const serverPushAt = schedule.pushAt + serverMinusClientSeconds;
+  const serverClassStartDate = schedule.classStartDate + serverMinusClientSeconds;
+  const serverClassEndDate = schedule.classEndDate + serverMinusClientSeconds;
+  const serverEndTransitionDate =
+    schedule.endAt === undefined ? undefined : schedule.endAt + serverMinusClientSeconds;
+  const serverDismissalDate =
+    schedule.dismissalDate === undefined ? undefined : schedule.dismissalDate + serverMinusClientSeconds;
+  const jobId = pushStartJobKey(schedule.userId, schedule.deviceId, schedule.courseId, schedule.classStartDate);
+  const contextKey = remoteStartContextKey(
+    schedule.userId,
+    schedule.deviceId,
+    schedule.courseId,
+    schedule.classStartDate,
+    schedule.classEndDate
+  );
+
+  store.upsertRemoteStartContext({
+    key: contextKey,
+    userId: schedule.userId,
+    deviceId: schedule.deviceId,
+    courseId: schedule.courseId,
+    clientClassStartDate: schedule.classStartDate,
+    clientClassEndDate: schedule.classEndDate,
+    serverClassStartDate,
+    serverClassEndDate,
+    serverEndTransitionDate,
+    serverDismissalDate,
+    sendStartTransition: schedule.initialPhase === 'before' && (schedule.endAt ?? schedule.classEndDate) > schedule.classStartDate,
+    createdAt: Math.floor(Date.now() / 1000)
+  });
+
+  store.upsertScheduledJob({
+    id: jobId,
+    kind: 'push_start',
+    userId: schedule.userId,
+    deviceId: schedule.deviceId,
+    dueAt: serverPushAt,
+    payload: buildPushStartJobPayload({
+      userId: schedule.userId,
+      deviceId: schedule.deviceId,
+      semester: schedule.semester,
+      courseName: schedule.courseName,
+      courseId: schedule.courseId,
+      location: schedule.location,
+      instructor: schedule.instructor,
+      initialPhase: schedule.initialPhase,
+      clientClassStartDate: schedule.classStartDate,
+      clientClassEndDate: schedule.classEndDate
+    })
+  });
+
+  return {
+    jobId,
+    userId: schedule.userId,
+    deviceId: schedule.deviceId,
+    courseId: schedule.courseId,
+    courseName: schedule.courseName,
+    initialPhase: schedule.initialPhase,
+    serverPushAt,
+    serverClassStartDate,
+    serverClassEndDate,
+    serverEndTransitionDate,
+    serverDismissalDate,
+    clientPushAt: schedule.pushAt,
+    clientClassStartDate: schedule.classStartDate,
+    clientClassEndDate: schedule.classEndDate,
+    clientEndAt: schedule.endAt,
+    clientDismissalDate: schedule.dismissalDate,
+    serverMinusClientSeconds,
+    hasPushToStartToken: Boolean(registration)
+  };
+}
 
 function validateRegisterPayload(value: unknown):
   | { valid: true; payload: RegisterActivityPayload }
@@ -681,7 +735,7 @@ function validatePushToStartSchedulePayload(value: unknown):
 
   const schedules: RemoteStartSchedulePayload[] = [];
   for (const [index, schedule] of value.schedules.entries()) {
-    const parsed = validateRemoteStartSchedulePayload(schedule);
+    const parsed = validateRemoteStartSchedulePayload(schedule, { allowSemesterRange: false });
     if (!parsed.valid) {
       return { valid: false, error: `schedules[${index}]: ${parsed.error}` };
     }
@@ -691,7 +745,83 @@ function validatePushToStartSchedulePayload(value: unknown):
   return { valid: true, payload: { schedules } };
 }
 
-function validateRemoteStartSchedulePayload(value: unknown):
+function validatePushToStartSemesterSyncPayload(value: unknown):
+  | { valid: true; payload: PushToStartSemesterSyncPayload }
+  | { valid: false; error: string } {
+  if (!isPlainObject(value)) {
+    return { valid: false, error: 'Request body must be a JSON object.' };
+  }
+
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [...PUSH_TO_START_SEMESTER_SYNC_KEYS].sort();
+  if (keys.length !== expectedKeys.length || !keys.every((key, index) => key === expectedKeys[index])) {
+    return {
+      valid: false,
+      error: `Request body must contain exactly these fields: ${PUSH_TO_START_SEMESTER_SYNC_KEYS.join(', ')}`
+    };
+  }
+
+  const { userId, deviceId, semester, semesterEndDate, schedules } = value;
+  if (!isNonEmptyString(userId)) {
+    return { valid: false, error: 'userId must be a non-empty string.' };
+  }
+  if (!isNonEmptyString(deviceId)) {
+    return { valid: false, error: 'deviceId must be a non-empty string.' };
+  }
+  if (!isNonEmptyString(semester)) {
+    return { valid: false, error: 'semester must be a non-empty string.' };
+  }
+  if (!isUnixTimestamp(semesterEndDate)) {
+    return { valid: false, error: 'semesterEndDate must be a Unix timestamp in seconds.' };
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (semesterEndDate < now) {
+    return { valid: false, error: 'semesterEndDate must be in the future.' };
+  }
+  if (semesterEndDate - now > MAX_SEMESTER_SYNC_SECONDS) {
+    return { valid: false, error: 'semesterEndDate cannot be more than 220 days in the future.' };
+  }
+  if (!Array.isArray(schedules)) {
+    return { valid: false, error: 'schedules must be an array.' };
+  }
+  if (schedules.length > 1000) {
+    return { valid: false, error: 'schedules cannot contain more than 1000 entries.' };
+  }
+
+  const parsedSchedules: RemoteStartSchedulePayload[] = [];
+  for (const [index, schedule] of schedules.entries()) {
+    const parsed = validateRemoteStartSchedulePayload(schedule, { allowSemesterRange: true });
+    if (!parsed.valid) {
+      return { valid: false, error: `schedules[${index}]: ${parsed.error}` };
+    }
+    if (parsed.payload.userId !== userId || parsed.payload.deviceId !== deviceId) {
+      return { valid: false, error: `schedules[${index}]: userId and deviceId must match the sync payload.` };
+    }
+    if (parsed.payload.classStartDate > semesterEndDate || parsed.payload.pushAt > semesterEndDate) {
+      return { valid: false, error: `schedules[${index}]: schedule must be before semesterEndDate.` };
+    }
+    parsedSchedules.push({
+      ...parsed.payload,
+      semester
+    });
+  }
+
+  return {
+    valid: true,
+    payload: {
+      userId,
+      deviceId,
+      semester,
+      semesterEndDate,
+      schedules: parsedSchedules
+    }
+  };
+}
+
+function validateRemoteStartSchedulePayload(
+  value: unknown,
+  options: { allowSemesterRange: boolean }
+):
   | { valid: true; payload: RemoteStartSchedulePayload }
   | { valid: false; error: string } {
   if (!isPlainObject(value)) {
@@ -699,7 +829,7 @@ function validateRemoteStartSchedulePayload(value: unknown):
   }
 
   const keys = Object.keys(value).sort();
-  const requiredKeys = REMOTE_START_SCHEDULE_KEYS.filter((key) => key !== 'dismissalDate' && key !== 'endAt');
+  const requiredKeys = REMOTE_START_SCHEDULE_KEYS.filter((key) => key !== 'dismissalDate' && key !== 'endAt' && key !== 'semester');
   const expectedKeys = [...requiredKeys].sort();
   const allowedKeys = [...REMOTE_START_SCHEDULE_KEYS];
   if (!keys.every((key) => allowedKeys.includes(key as (typeof REMOTE_START_SCHEDULE_KEYS)[number]))) {
@@ -712,6 +842,7 @@ function validateRemoteStartSchedulePayload(value: unknown):
   const {
     userId,
     deviceId,
+    semester,
     courseName,
     courseId,
     location,
@@ -728,6 +859,9 @@ function validateRemoteStartSchedulePayload(value: unknown):
   }
   if (!isNonEmptyString(deviceId)) {
     return { valid: false, error: 'deviceId must be a non-empty string.' };
+  }
+  if (semester !== undefined && !isNonEmptyString(semester)) {
+    return { valid: false, error: 'semester must be a non-empty string when provided.' };
   }
   if (!isNonEmptyString(courseName)) {
     return { valid: false, error: 'courseName must be a non-empty string.' };
@@ -785,7 +919,11 @@ function validateRemoteStartSchedulePayload(value: unknown):
     parsedDismissalDate ?? 0
   );
   if ((furthestScheduledDate - now) * 1000 > MAX_TIMEOUT_MS) {
-    return { valid: false, error: 'schedule dates must be within 24.8 days of the current server time.' };
+    if (!options.allowSemesterRange || furthestScheduledDate - now > MAX_SEMESTER_SYNC_SECONDS) {
+      return { valid: false, error: options.allowSemesterRange
+        ? 'schedule dates must be within 220 days of the current server time.'
+        : 'schedule dates must be within 24.8 days of the current server time.' };
+    }
   }
 
   return {
@@ -793,6 +931,7 @@ function validateRemoteStartSchedulePayload(value: unknown):
     payload: {
       userId,
       deviceId,
+      semester: typeof semester === 'string' ? semester : undefined,
       courseName,
       courseId,
       location,

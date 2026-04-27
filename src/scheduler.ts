@@ -23,6 +23,7 @@ interface ScheduleOptions {
 interface PushStartJobPayload extends RemoteStartPayload {
   userId: string;
   deviceId: string;
+  semester?: string;
   initialPhase: ActivityPhase;
   clientClassStartDate: number;
   clientClassEndDate: number;
@@ -318,6 +319,7 @@ function parsePushStartPayload(value: unknown): PushStartJobPayload {
     courseId: requiredString(value.courseId, 'courseId'),
     location: requiredString(value.location, 'location'),
     instructor: requiredString(value.instructor, 'instructor'),
+    semester: optionalString(value.semester),
     initialPhase: requiredString(value.initialPhase, 'initialPhase') as ActivityPhase,
     clientClassStartDate: requiredNumber(value.clientClassStartDate, 'clientClassStartDate'),
     clientClassEndDate: requiredNumber(value.clientClassEndDate, 'clientClassEndDate')
@@ -347,6 +349,10 @@ function requiredString(value: unknown, name: string): string {
     throw new Error(`Expected ${name} to be a string.`);
   }
   return value;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
 }
 
 function requiredNumber(value: unknown, name: string): number {

@@ -102,7 +102,7 @@ export class ActivityStore {
       SET status = 'cancelled', updated_at = ?
       WHERE kind IN ('activity_start', 'activity_end')
         AND status IN ('queued', 'processing', 'failed')
-        AND json_extract(payload, '$.activityId') = ?
+        AND json_extract(payload_json, '$.activityId') = ?
     `).run(nowSeconds(), activityId);
     return result.changes > 0;
   }
@@ -344,6 +344,38 @@ export class ActivityStore {
       WHERE user_id = ? AND device_id = ? AND consumed_at IS NULL
     `).run(nowSeconds(), userId, deviceId);
     return result.changes;
+  }
+
+  cancelStalePushStartJobsForSemester(
+    userId: string,
+    deviceId: string,
+    semester: string,
+    activeJobIds: string[]
+  ): number {
+    const now = nowSeconds();
+    if (activeJobIds.length === 0) {
+      return this.db.prepare(`
+        UPDATE scheduled_jobs
+        SET status = 'cancelled', locked_until = NULL, updated_at = ?
+        WHERE user_id = ?
+          AND device_id = ?
+          AND kind = 'push_start'
+          AND status IN ('queued', 'processing', 'failed')
+          AND json_extract(payload_json, '$.semester') = ?
+      `).run(now, userId, deviceId, semester).changes;
+    }
+
+    const placeholders = activeJobIds.map(() => '?').join(', ');
+    return this.db.prepare(`
+      UPDATE scheduled_jobs
+      SET status = 'cancelled', locked_until = NULL, updated_at = ?
+      WHERE user_id = ?
+        AND device_id = ?
+        AND kind = 'push_start'
+        AND status IN ('queued', 'processing', 'failed')
+        AND json_extract(payload_json, '$.semester') = ?
+        AND id NOT IN (${placeholders})
+    `).run(now, userId, deviceId, semester, ...activeJobIds).changes;
   }
 
   private migrate(): void {

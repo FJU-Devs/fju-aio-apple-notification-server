@@ -224,6 +224,45 @@ export const openApiDocument = {
         }
       }
     },
+    '/push-to-start/sync-semester': {
+      post: {
+        tags: ['Activities'],
+        summary: 'Sync semester Live Activity schedule',
+        description: 'Upserts concrete future course occurrences for a semester and cancels stale queued jobs for that user/device/semester.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                $ref: '#/components/schemas/PushToStartSemesterSyncPayload'
+              },
+              example: {
+                userId: '111111111',
+                deviceId: '8D6B8C7E-8143-46E6-B61F-8E4E4C853111',
+                semester: '114-2',
+                semesterEndDate: 1785513599,
+                schedules: pushToStartScheduleExample.schedules
+              }
+            }
+          }
+        },
+        responses: {
+          '202': {
+            description: 'Semester schedules synced.'
+          },
+          '400': {
+            description: 'Validation failed.',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/ErrorResponse'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     '/push-to-start/cancel': {
       post: {
         tags: ['Activities'],
@@ -421,6 +460,36 @@ export const openApiDocument = {
         },
         example: pushToStartScheduleExample
       },
+      PushToStartSemesterSyncPayload: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['userId', 'deviceId', 'semester', 'semesterEndDate', 'schedules'],
+        properties: {
+          userId: {
+            type: 'string',
+            minLength: 1
+          },
+          deviceId: {
+            type: 'string',
+            minLength: 1
+          },
+          semester: {
+            type: 'string',
+            minLength: 1
+          },
+          semesterEndDate: {
+            type: 'integer',
+            minimum: 1
+          },
+          schedules: {
+            type: 'array',
+            maxItems: 1000,
+            items: {
+              $ref: '#/components/schemas/RemoteStartSchedulePayload'
+            }
+          }
+        }
+      },
       RemoteStartSchedulePayload: {
         type: 'object',
         additionalProperties: false,
@@ -442,6 +511,10 @@ export const openApiDocument = {
             minLength: 1
           },
           deviceId: {
+            type: 'string',
+            minLength: 1
+          },
+          semester: {
             type: 'string',
             minLength: 1
           },

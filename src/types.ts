@@ -28,6 +28,7 @@ export interface RemoteStartPayload {
 export interface RemoteStartSchedulePayload extends RemoteStartPayload {
   userId: string;
   deviceId: string;
+  semester?: string;
   pushAt: number;
   classStartDate: number;
   classEndDate: number;
@@ -37,6 +38,14 @@ export interface RemoteStartSchedulePayload extends RemoteStartPayload {
 }
 
 export interface PushToStartSchedulePayload {
+  schedules: RemoteStartSchedulePayload[];
+}
+
+export interface PushToStartSemesterSyncPayload {
+  userId: string;
+  deviceId: string;
+  semester: string;
+  semesterEndDate: number;
   schedules: RemoteStartSchedulePayload[];
 }
 
