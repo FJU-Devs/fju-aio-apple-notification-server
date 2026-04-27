@@ -9,6 +9,8 @@ import type { ActivityPhase, ApnsSendResult, CourseActivityContentState } from '
 const APNS_ORIGIN = config.apnsUseSandbox
   ? 'https://api.sandbox.push.apple.com'
   : 'https://api.push.apple.com';
+const APPLE_REFERENCE_DATE_UNIX_SECONDS = 978_307_200;
+const ENDED_DISMISSAL_DELAY_SECONDS = 30;
 
 let cachedJwt: { token: string; issuedAt: number } | undefined;
 let cachedPrivateKey: ReturnType<typeof createPrivateKey> | undefined;
@@ -84,6 +86,10 @@ function buildAlert(phase: ActivityPhase, courseName: string): { title: string; 
   };
 }
 
+function toAppleReferenceDateSeconds(unixSeconds: number): number {
+  return unixSeconds - APPLE_REFERENCE_DATE_UNIX_SECONDS;
+}
+
 async function sendLiveActivityEvent(args: {
   pushToken: string;
   event: 'update' | 'end';
@@ -97,14 +103,18 @@ async function sendLiveActivityEvent(args: {
   const jwt = getJwt();
   const contentState: CourseActivityContentState = {
     phase: args.phase,
-    classStartDate: args.classStartDate,
-    classEndDate: args.classEndDate
+    classStartDate: toAppleReferenceDateSeconds(args.classStartDate),
+    classEndDate: toAppleReferenceDateSeconds(args.classEndDate)
   };
   const aps: Record<string, unknown> = {
     timestamp: Math.floor(Date.now() / 1000),
     event: args.event,
     'content-state': contentState
   };
+
+  if (args.event === 'end') {
+    aps['dismissal-date'] = args.classEndDate + ENDED_DISMISSAL_DELAY_SECONDS;
+  }
 
   if (args.includeAlert !== false) {
     aps.alert = buildAlert(args.phase, args.courseName);
